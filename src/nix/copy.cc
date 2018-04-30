@@ -57,16 +57,22 @@ struct CmdCopy : StorePathsCommand
         return {
             Example{
                 "To copy Firefox from the local store to a binary cache in file:///tmp/cache:",
-                "nix copy --to file:///tmp/cache -r $(type -p firefox)"
+                "nix copy --to file:///tmp/cache $(type -p firefox)"
             },
             Example{
                 "To copy the entire current NixOS system closure to another machine via SSH:",
-                "nix copy --to ssh://server -r /run/current-system"
+                "nix copy --to ssh://server /run/current-system"
             },
             Example{
                 "To copy a closure from another machine via SSH:",
-                "nix copy --from ssh://server -r /nix/store/a6cnl93nk1wxnq84brbbwr6hxw9gp2w9-blender-2.79-rc2"
+                "nix copy --from ssh://server /nix/store/a6cnl93nk1wxnq84brbbwr6hxw9gp2w9-blender-2.79-rc2"
             },
+#ifdef ENABLE_S3
+            Example{
+                "To populate the current folder build output to a S3 binary cache:",
+                "nix copy --to s3://my-bucket?region=eu-west-1"
+            },
+#endif
         };
     }
 

@@ -53,7 +53,6 @@ LocalStore::LocalStore(const Params & params)
     , trashDir(realStoreDir + "/trash")
     , tempRootsDir(stateDir + "/temproots")
     , fnTempRoots(fmt("%s/%d", tempRootsDir, getpid()))
-    , publicKeys(getDefaultPublicKeys())
 {
     auto state(_state.lock());
 
@@ -964,21 +963,21 @@ void LocalStore::invalidatePath(State & state, const Path & path)
 }
 
 
-void LocalStore::addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+const PublicKeys & LocalStore::getPublicKeys()
+{
+    auto state(_state.lock());
+    if (!state->publicKeys)
+        state->publicKeys = std::make_unique<PublicKeys>(getDefaultPublicKeys());
+    return *state->publicKeys;
+}
+
+
+void LocalStore::addToStore(const ValidPathInfo & info, Source & source,
     RepairFlag repair, CheckSigsFlag checkSigs, std::shared_ptr<FSAccessor> accessor)
 {
     assert(info.narHash);
 
-    Hash h = hashString(htSHA256, *nar);
-    if (h != info.narHash)
-        throw Error("hash mismatch importing path '%s'; expected hash '%s', got '%s'",
-            info.path, info.narHash.to_string(), h.to_string());
-
-    if (nar->size() != info.narSize)
-        throw Error("size mismatch importing path '%s'; expected %s, got %s",
-            info.path, info.narSize, nar->size());
-
-    if (requireSigs && checkSigs && !info.checkSignatures(*this, publicKeys))
+    if (requireSigs && checkSigs && !info.checkSignatures(*this, getPublicKeys()))
         throw Error("cannot add path '%s' because it lacks a valid signature", info.path);
 
     addTempRoot(info.path);
@@ -992,16 +991,34 @@ void LocalStore::addToStore(const ValidPathInfo & info, const ref<std::string> &
         /* Lock the output path.  But don't lock if we're being called
            from a build hook (whose parent process already acquired a
            lock on this path). */
-        Strings locksHeld = tokenizeString<Strings>(getEnv("NIX_HELD_LOCKS"));
-        if (find(locksHeld.begin(), locksHeld.end(), info.path) == locksHeld.end())
+        if (!locksHeld.count(info.path))
             outputLock.lockPaths({realPath});
 
         if (repair || !isValidPath(info.path)) {
 
             deletePath(realPath);
 
-            StringSource source(*nar);
-            restorePath(realPath, source);
+            /* While restoring the path from the NAR, compute the hash
+               of the NAR. */
+            HashSink hashSink(htSHA256);
+
+            LambdaSource wrapperSource([&](unsigned char * data, size_t len) -> size_t {
+                size_t n = source.read(data, len);
+                hashSink(data, n);
+                return n;
+            });
+
+            restorePath(realPath, wrapperSource);
+
+            auto hashResult = hashSink.finish();
+
+            if (hashResult.first != info.narHash)
+                throw Error("hash mismatch importing path '%s'; expected hash '%s', got '%s'",
+                    info.path, info.narHash.to_string(), hashResult.first.to_string());
+
+            if (hashResult.second != info.narSize)
+                throw Error("size mismatch importing path '%s'; expected %s, got %s",
+                    info.path, info.narSize, hashResult.second);
 
             autoGC();
 
@@ -1216,7 +1233,7 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
                 /* Check the content hash (optionally - slow). */
                 printMsg(lvlTalkative, format("checking contents of '%1%'") % i);
-                HashResult current = hashPath(info->narHash.type, i);
+                HashResult current = hashPath(info->narHash.type, toRealPath(i));
 
                 if (info->narHash != nullHash && info->narHash != current.first) {
                     printError(format("path '%1%' was modified! "

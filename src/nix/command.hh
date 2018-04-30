@@ -5,8 +5,10 @@
 
 namespace nix {
 
+extern std::string programPath;
+
 struct Value;
-struct Bindings;
+class Bindings;
 class EvalState;
 
 /* A command is an argument parser that can be executed by calling its
@@ -196,7 +198,7 @@ std::shared_ptr<Installable> parseInstallable(
     SourceExprCommand & cmd, ref<Store> store, const std::string & installable,
     bool useDefaultInstallables);
 
-Buildables toBuildables(ref<Store> store, RealiseMode mode,
+Buildables build(ref<Store> store, RealiseMode mode,
     std::vector<std::shared_ptr<Installable>> installables);
 
 PathSet toStorePaths(ref<Store> store, RealiseMode mode,

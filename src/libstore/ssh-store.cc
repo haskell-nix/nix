@@ -51,21 +51,16 @@ private:
     std::string host;
 
     SSHMaster master;
-};
 
-
-class ForwardSource : public Source
-{
-    Source & readSource;
-    Sink & writeSink;
-public:
-    ForwardSource(Source & readSource, Sink & writeSink) : readSource(readSource), writeSink(writeSink) {}
-    size_t read(unsigned char * data, size_t len) override
+    void setOptions(RemoteStore::Connection & conn) override
     {
-        auto res = readSource.read(data, len);
-        writeSink(data, len);
-        return res;
-    }
+        /* TODO Add a way to explicitly ask for some options to be
+           forwarded. One option: A way to query the daemon for its
+           settings, and then a series of params to SSHStore like
+           forward-cores or forward-overridden-cores that only
+           override the requested settings.
+        */
+    };
 };
 
 void SSHStore::narFromPath(const Path & path, Sink & sink)
@@ -73,9 +68,7 @@ void SSHStore::narFromPath(const Path & path, Sink & sink)
     auto conn(connections->get());
     conn->to << wopNarFromPath << path;
     conn->processStderr();
-    ParseSink ps;
-    auto fwd = ForwardSource(conn->from, sink);
-    parseDump(ps, fwd);
+    copyNAR(conn->from, sink);
 }
 
 ref<FSAccessor> SSHStore::getFSAccessor()

@@ -27,6 +27,9 @@ std::regex commitHashRegex("^[0-9a-fA-F]{40}$");
 HgInfo exportMercurial(ref<Store> store, const std::string & uri,
     std::string rev, const std::string & name)
 {
+    if (settings.pureEval && rev == "")
+        throw Error("in pure evaluation mode, 'fetchMercurial' requires a Mercurial revision");
+
     if (rev == "" && hasPrefix(uri, "/") && pathExists(uri + "/.hg")) {
 
         bool clean = runProgram("hg", true, { "status", "-R", uri, "--modified", "--added", "--removed" }) == "";
@@ -77,7 +80,7 @@ HgInfo exportMercurial(ref<Store> store, const std::string & uri,
     time_t now = time(0);
     struct stat st;
     if (stat(stampFile.c_str(), &st) != 0 ||
-        st.st_mtime <= now - settings.tarballTtl)
+        st.st_mtime + settings.tarballTtl <= now)
     {
         /* Except that if this is a commit hash that we already have,
            we don't have to pull again. */
@@ -196,6 +199,9 @@ static void prim_fetchMercurial(EvalState & state, const Pos & pos, Value * * ar
     mkString(*state.allocAttr(v, state.symbols.create("shortRev")), std::string(hgInfo.rev, 0, 12));
     mkInt(*state.allocAttr(v, state.symbols.create("revCount")), hgInfo.revCount);
     v.attrs->sort();
+
+    if (state.allowedPaths)
+        state.allowedPaths->insert(hgInfo.storePath);
 }
 
 static RegisterPrimOp r("fetchMercurial", 1, prim_fetchMercurial);

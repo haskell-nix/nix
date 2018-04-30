@@ -52,11 +52,16 @@ struct CmdEdit : InstallableCommand
             throw Error("cannot parse meta.position attribute '%s'", pos);
 
         std::string filename(pos, 0, colon);
-        int lineno = std::stoi(std::string(pos, colon + 1));
+        int lineno;
+        try {
+            lineno = std::stoi(std::string(pos, colon + 1));
+        } catch (std::invalid_argument e) {
+            throw Error("cannot parse line number '%s'", pos);
+        }
 
         auto editor = getEnv("EDITOR", "cat");
 
-        Strings args{editor};
+        auto args = tokenizeString<Strings>(editor);
 
         if (editor.find("emacs") != std::string::npos ||
             editor.find("nano") != std::string::npos ||
@@ -67,7 +72,7 @@ struct CmdEdit : InstallableCommand
 
         stopProgressBar();
 
-        execvp(editor.c_str(), stringsToCharPtrs(args).data());
+        execvp(args.front().c_str(), stringsToCharPtrs(args).data());
 
         throw SysError("cannot run editor '%s'", editor);
     }

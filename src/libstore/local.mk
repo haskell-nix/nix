@@ -4,11 +4,14 @@ libstore_NAME = libnixstore
 
 libstore_DIR := $(d)
 
-libstore_SOURCES := $(wildcard $(d)/*.cc)
+libstore_SOURCES := $(wildcard $(d)/*.cc $(d)/builtins/*.cc)
 
 libstore_LIBS = libutil libformat
 
 libstore_LDFLAGS = $(SQLITE3_LIBS) -lbz2 $(LIBCURL_LIBS) $(SODIUM_LIBS) -pthread
+ifneq ($(OS), FreeBSD)
+ libstore_LDFLAGS += -ldl
+endif
 
 libstore_FILES = sandbox-defaults.sb sandbox-minimal.sb sandbox-network.sb
 
@@ -22,7 +25,7 @@ ifeq ($(OS), SunOS)
 	libstore_LDFLAGS += -lsocket
 endif
 
-ifeq ($(OS), Linux)
+ifeq ($(HAVE_SECCOMP), 1)
 	libstore_LDFLAGS += -lseccomp
 endif
 
@@ -35,6 +38,7 @@ libstore_CXXFLAGS = \
  -DNIX_CONF_DIR=\"$(sysconfdir)/nix\" \
  -DNIX_LIBEXEC_DIR=\"$(libexecdir)\" \
  -DNIX_BIN_DIR=\"$(bindir)\" \
+ -DNIX_MAN_DIR=\"$(mandir)\" \
  -DSANDBOX_SHELL="\"$(sandbox_shell)\"" \
  -DLSOF=\"$(lsof)\"
 

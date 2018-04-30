@@ -25,14 +25,14 @@ std::string hilite(const std::string & s, const std::smatch & m)
 
 struct CmdSearch : SourceExprCommand, MixJSON
 {
-    std::string re;
+    std::vector<std::string> res;
 
     bool writeCache = true;
     bool useCache = true;
 
     CmdSearch()
     {
-        expectArg("regex", &re, true);
+        expectArgs("regex", &res);
 
         mkFlag()
             .longName("update-cache")
@@ -68,8 +68,12 @@ struct CmdSearch : SourceExprCommand, MixJSON
                 "nix search blender"
             },
             Example{
-                "To search for Firefox and Chromium:",
+                "To search for Firefox or Chromium:",
                 "nix search 'firefox|chromium'"
+            },
+            Example{
+                "To search for git and frontend or gui:",
+                "nix search git 'frontend|gui'"
             },
         };
     }
@@ -78,11 +82,21 @@ struct CmdSearch : SourceExprCommand, MixJSON
     {
         settings.readOnlyMode = true;
 
-        std::regex regex(re, std::regex::extended | std::regex::icase);
+        // Empty search string should match all packages
+        // Use "^" here instead of ".*" due to differences in resulting highlighting
+        // (see #1893 -- libc++ claims empty search string is not in POSIX grammar)
+        if (res.empty()) {
+            res.push_back("^");
+        }
+
+        std::vector<std::regex> regexes;
+        regexes.reserve(res.size());
+
+        for (auto &re : res) {
+            regexes.push_back(std::regex(re, std::regex::extended | std::regex::icase));
+        }
 
         auto state = getEvalState();
-
-        bool first = true;
 
         auto jsonOut = json ? std::make_unique<JSONObject>(std::cout) : nullptr;
 
@@ -91,12 +105,15 @@ struct CmdSearch : SourceExprCommand, MixJSON
 
         bool fromCache = false;
 
+        std::map<std::string, std::string> results;
+
         std::function<void(Value *, std::string, bool, JSONObject *)> doExpr;
 
         doExpr = [&](Value * v, std::string attrPath, bool toplevel, JSONObject * cache) {
             debug("at attribute '%s'", attrPath);
 
             try {
+                uint found = 0;
 
                 state->forceValue(*v);
 
@@ -110,25 +127,33 @@ struct CmdSearch : SourceExprCommand, MixJSON
                 if (state->isDerivation(*v)) {
 
                     DrvInfo drv(*state, attrPath, v->attrs);
+                    std::string description;
+                    std::smatch attrPathMatch;
+                    std::smatch descriptionMatch;
+                    std::smatch nameMatch;
+                    std::string name;
 
                     DrvName parsed(drv.queryName());
 
-                    std::smatch attrPathMatch;
-                    std::regex_search(attrPath, attrPathMatch, regex);
+                    for (auto &regex : regexes) {
+                        std::regex_search(attrPath, attrPathMatch, regex);
 
-                    auto name = parsed.name;
-                    std::smatch nameMatch;
-                    std::regex_search(name, nameMatch, regex);
+                        name = parsed.name;
+                        std::regex_search(name, nameMatch, regex);
 
-                    std::string description = drv.queryMetaString("description");
-                    std::replace(description.begin(), description.end(), '\n', ' ');
-                    std::smatch descriptionMatch;
-                    std::regex_search(description, descriptionMatch, regex);
+                        description = drv.queryMetaString("description");
+                        std::replace(description.begin(), description.end(), '\n', ' ');
+                        std::regex_search(description, descriptionMatch, regex);
 
-                    if (!attrPathMatch.empty()
-                        || !nameMatch.empty()
-                        || !descriptionMatch.empty())
-                    {
+                        if (!attrPathMatch.empty()
+                            || !nameMatch.empty()
+                            || !descriptionMatch.empty())
+                        {
+                            found++;
+                        }
+                    }
+
+                    if (found == res.size()) {
                         if (json) {
 
                             auto jsonElem = jsonOut->object(attrPath);
@@ -138,10 +163,7 @@ struct CmdSearch : SourceExprCommand, MixJSON
                             jsonElem.attr("description", description);
 
                         } else {
-                            if (!first) std::cout << "\n";
-                            first = false;
-
-                            std::cout << fmt(
+                            results[attrPath] = fmt(
                                 "Attribute name: %s\n"
                                 "Package name: %s\n"
                                 "Version: %s\n"
@@ -214,17 +236,35 @@ struct CmdSearch : SourceExprCommand, MixJSON
         }
 
         else {
+            createDirs(dirOf(jsonCacheFileName));
+
             Path tmpFile = fmt("%s.tmp.%d", jsonCacheFileName, getpid());
 
-            std::ofstream jsonCacheFile(tmpFile);
+            std::ofstream jsonCacheFile;
 
-            auto cache = writeCache ? std::make_unique<JSONObject>(jsonCacheFile, false) : nullptr;
+            try {
+                // iostream considered harmful
+                jsonCacheFile.exceptions(std::ofstream::failbit);
+                jsonCacheFile.open(tmpFile);
 
-            doExpr(getSourceExpr(*state), "", true, cache.get());
+                auto cache = writeCache ? std::make_unique<JSONObject>(jsonCacheFile, false) : nullptr;
 
-            if (rename(tmpFile.c_str(), jsonCacheFileName.c_str()) == -1)
+                doExpr(getSourceExpr(*state), "", true, cache.get());
+
+            } catch (std::exception &) {
+                /* Fun fact: catching std::ios::failure does not work
+                   due to C++11 ABI shenanigans.
+                   https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66145 */
+                if (!jsonCacheFile)
+                    throw Error("error writing to %s", tmpFile);
+            }
+
+            if (writeCache && rename(tmpFile.c_str(), jsonCacheFileName.c_str()) == -1)
                 throw SysError("cannot rename '%s' to '%s'", tmpFile, jsonCacheFileName);
         }
+
+        for (auto el : results) std::cout << el.second << "\n";
+
     }
 };
 

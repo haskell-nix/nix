@@ -29,7 +29,7 @@ struct CaseHackSetting : public BaseSetting<bool>
     void set(const std::string & str) override
     {
         BaseSetting<bool>::set(str);
-        nix::useCaseHack = true;
+        nix::useCaseHack = value;
     }
 };
 
@@ -81,6 +81,9 @@ public:
 
     /* The directory where the main programs are stored. */
     Path nixBinDir;
+
+    /* The directory where the man pages are stored. */
+    Path nixManDir;
 
     /* File name of the socket the daemon listens to.  */
     Path nixDaemonSocketFile;
@@ -138,6 +141,11 @@ public:
     Setting<std::string> builders{this, "@" + nixConfDir + "/machines", "builders",
         "A semicolon-separated list of build machines, in the format of nix.machines."};
 
+    Setting<bool> buildersUseSubstitutes{this, false, "builders-use-substitutes",
+        "Whether build machines should use their own substitutes for obtaining "
+        "build dependencies if possible, rather than waiting for this host to "
+        "upload them."};
+
     Setting<off_t> reservedSize{this, 8 * 1024 * 1024, "gc-reserved-space",
         "Amount of reserved disk space for the garbage collector."};
 
@@ -150,7 +158,7 @@ public:
     Setting<bool> syncBeforeRegistering{this, false, "sync-before-registering",
         "Whether to call sync() before registering a path as valid."};
 
-    Setting<bool> useSubstitutes{this, true, "use-substitutes",
+    Setting<bool> useSubstitutes{this, true, "substitute",
         "Whether to use substitutes.",
         {"build-use-substitutes"}};
 
@@ -206,7 +214,8 @@ public:
     bool lockCPU;
 
     /* Whether to show a stack trace if Nix evaluation fails. */
-    bool showTrace = false;
+    Setting<bool> showTrace{this, false, "show-trace",
+        "Whether to show a stack trace on evaluation errors."};
 
     Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation",
         "Whether builtin functions that allow executing native code should be enabled."};
@@ -226,6 +235,9 @@ public:
     Setting<bool> restrictEval{this, false, "restrict-eval",
         "Whether to restrict file system access to paths in $NIX_PATH, "
         "and network access to the URI prefixes listed in 'allowed-uris'."};
+
+    Setting<bool> pureEval{this, false, "pure-eval",
+        "Whether to restrict file system and network access to files specified by cryptographic hash."};
 
     Setting<size_t> buildRepeat{this, 0, "repeat",
         "The number of times to repeat a build in order to verify determinism.",
@@ -278,13 +290,17 @@ public:
     Setting<unsigned int> tarballTtl{this, 60 * 60, "tarball-ttl",
         "How soon to expire files fetched by builtins.fetchTarball and builtins.fetchurl."};
 
-    Setting<std::string> signedBinaryCaches{this, "*", "signed-binary-caches",
-        "Obsolete."};
-
-    Setting<bool> requireSigs{this, signedBinaryCaches == "*", "require-sigs",
+    Setting<bool> requireSigs{this, true, "require-sigs",
         "Whether to check that any non-content-addressed path added to the "
         "Nix store has a valid signature (that is, one signed using a key "
         "listed in 'trusted-public-keys'."};
+
+    Setting<StringSet> extraPlatforms{this,
+        std::string{SYSTEM} == "x86_64-linux" ? StringSet{"i686-linux"} : StringSet{},
+        "extra-platforms",
+        "Additional platforms that can be built on the local system. "
+        "These may be supported natively (e.g. armv7 on some aarch64 CPUs "
+        "or using hacks like qemu-user."};
 
     Setting<Strings> substituters{this,
         nixStore == "/nix/store" ? Strings{"https://cache.nixos.org/"} : Strings(),
@@ -303,6 +319,14 @@ public:
 
     Setting<Strings> trustedUsers{this, {"root"}, "trusted-users",
         "Which users or groups are trusted to ask the daemon to do unsafe things."};
+
+    Setting<unsigned int> ttlNegativeNarInfoCache{this, 3600, "narinfo-cache-negative-ttl",
+        "The TTL in seconds for negative lookups in the disk cache i.e binary cache lookups that "
+        "return an invalid path result"};
+
+    Setting<unsigned int> ttlPositiveNarInfoCache{this, 30 * 24 * 3600, "narinfo-cache-positive-ttl",
+        "The TTL in seconds for positive lookups in the disk cache i.e binary cache lookups that "
+        "return a valid path result."};
 
     /* ?Who we trust to use the daemon in safe ways */
     Setting<Strings> allowedUsers{this, {"*"}, "allowed-users",
@@ -361,14 +385,28 @@ public:
 
     Setting<Strings> allowedUris{this, {}, "allowed-uris",
         "Prefixes of URIs that builtin functions such as fetchurl and fetchGit are allowed to fetch."};
+
+    Setting<Paths> pluginFiles{this, {}, "plugin-files",
+        "Plugins to dynamically load at nix initialization time."};
 };
 
 
 // FIXME: don't use a global variable.
 extern Settings settings;
 
+/* This should be called after settings are initialized, but before
+   anything else */
+void initPlugins();
+
 
 extern const string nixVersion;
+
+struct RegisterSetting
+{
+    typedef std::vector<AbstractSetting *> SettingRegistrations;
+    static SettingRegistrations * settingRegistrations;
+    RegisterSetting(AbstractSetting * s);
+};
 
 
 }

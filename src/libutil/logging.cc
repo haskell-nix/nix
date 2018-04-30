@@ -6,7 +6,16 @@
 
 namespace nix {
 
-thread_local ActivityId curActivity = 0;
+static thread_local ActivityId curActivity = 0;
+
+ActivityId getCurActivity()
+{
+    return curActivity;
+}
+void setCurActivity(const ActivityId activityId)
+{
+    curActivity = activityId;
+}
 
 Logger * logger = makeDefaultLogger();
 
@@ -44,11 +53,12 @@ public:
             prefix = std::string("<") + c + ">";
         }
 
-        writeToStderr(prefix + (tty ? fs.s : filterANSIEscapes(fs.s)) + "\n");
+        writeToStderr(prefix + filterANSIEscapes(fs.s, !tty) + "\n");
     }
 
     void startActivity(ActivityId act, Verbosity lvl, ActivityType type,
         const std::string & s, const Fields & fields, ActivityId parent)
+        override
     {
         if (lvl <= verbosity && !s.empty())
             log(lvl, s + "...");
@@ -218,6 +228,14 @@ bool handleJSONLogMessage(const std::string & msg,
     }
 
     return true;
+}
+
+Activity::~Activity() {
+    try {
+        logger.stopActivity(id);
+    } catch (...) {
+        ignoreException();
+    }
 }
 
 }

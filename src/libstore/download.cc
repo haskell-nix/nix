@@ -17,11 +17,13 @@
 
 #include <curl/curl.h>
 
-#include <queue>
-#include <iostream>
-#include <thread>
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <iostream>
+#include <queue>
 #include <random>
+#include <thread>
 
 using namespace std::string_literals;
 
@@ -91,6 +93,8 @@ struct CurlDownloader : public Downloader
         {
             if (!request.expectedETag.empty())
                 requestHeaders = curl_slist_append(requestHeaders, ("If-None-Match: " + request.expectedETag).c_str());
+            if (!request.mimeType.empty())
+                requestHeaders = curl_slist_append(requestHeaders, ("Content-Type: " + request.mimeType).c_str());
         }
 
         ~DownloadItem()
@@ -169,7 +173,11 @@ struct CurlDownloader : public Downloader
 
         int progressCallback(double dltotal, double dlnow)
         {
-            act.progress(dlnow, dltotal);
+            try {
+              act.progress(dlnow, dltotal);
+            } catch (nix::Interrupted &) {
+              assert(_isInterrupted);
+            }
             return _isInterrupted;
         }
 
@@ -183,6 +191,23 @@ struct CurlDownloader : public Downloader
             if (type == CURLINFO_TEXT)
                 vomit("curl: %s", chomp(std::string(data, size)));
             return 0;
+        }
+
+        size_t readOffset = 0;
+        int readCallback(char *buffer, size_t size, size_t nitems)
+        {
+            if (readOffset == request.data->length())
+                return 0;
+            auto count = std::min(size * nitems, request.data->length() - readOffset);
+            assert(count);
+            memcpy(buffer, request.data->data() + readOffset, count);
+            readOffset += count;
+            return count;
+        }
+
+        static int readCallbackWrapper(char *buffer, size_t size, size_t nitems, void * userp)
+        {
+            return ((DownloadItem *) userp)->readCallback(buffer, size, nitems);
         }
 
         long lowSpeedTimeout = 300;
@@ -225,6 +250,13 @@ struct CurlDownloader : public Downloader
             if (request.head)
                 curl_easy_setopt(req, CURLOPT_NOBODY, 1);
 
+            if (request.data) {
+                curl_easy_setopt(req, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(req, CURLOPT_READFUNCTION, readCallbackWrapper);
+                curl_easy_setopt(req, CURLOPT_READDATA, this);
+                curl_easy_setopt(req, CURLOPT_INFILESIZE_LARGE, (curl_off_t) request.data->length());
+            }
+
             if (request.verifyTLS) {
                 if (settings.caFile != "")
                     curl_easy_setopt(req, CURLOPT_CAINFO, settings.caFile.c_str());
@@ -265,7 +297,7 @@ struct CurlDownloader : public Downloader
             }
 
             if (code == CURLE_OK &&
-                (httpStatus == 200 || httpStatus == 304 || httpStatus == 226 /* FTP */ || httpStatus == 0 /* other protocol */))
+                (httpStatus == 200 || httpStatus == 201 || httpStatus == 204 || httpStatus == 304 || httpStatus == 226 /* FTP */ || httpStatus == 0 /* other protocol */))
             {
                 result.cached = httpStatus == 304;
                 done = true;
@@ -303,6 +335,7 @@ struct CurlDownloader : public Downloader
                     // Don't bother retrying on certain cURL errors either
                     switch (code) {
                         case CURLE_FAILED_INIT:
+                        case CURLE_URL_MALFORMAT:
                         case CURLE_NOT_BUILT_IN:
                         case CURLE_REMOTE_ACCESS_DENIED:
                         case CURLE_FILE_COULDNT_READ_FILE:
@@ -311,10 +344,11 @@ struct CurlDownloader : public Downloader
                         case CURLE_BAD_FUNCTION_ARGUMENT:
                         case CURLE_INTERFACE_FAILED:
                         case CURLE_UNKNOWN_OPTION:
-                        err = Misc;
-                        break;
+                        case CURLE_SSL_CACERT_BADFILE:
+                            err = Misc;
+                            break;
                         default: // Shut up warnings
-                        break;
+                            break;
                     }
                 }
 
@@ -369,11 +403,13 @@ struct CurlDownloader : public Downloader
 
         curlm = curl_multi_init();
 
-        #if LIBCURL_VERSION_NUM >= 0x072b00 // correct?
+        #if LIBCURL_VERSION_NUM >= 0x072b00 // Multiplex requires >= 7.43.0
         curl_multi_setopt(curlm, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
         #endif
+        #if LIBCURL_VERSION_NUM >= 0x071e00 // Max connections requires >= 7.30.0
         curl_multi_setopt(curlm, CURLMOPT_MAX_TOTAL_CONNECTIONS,
             settings.binaryCachesParallelConnections.get());
+        #endif
 
         enableHttp2 = settings.enableHttp2;
 
@@ -600,7 +636,7 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
     if (expectedHash) {
         expectedStorePath = store->makeFixedOutputPath(unpack, expectedHash, name);
         if (store->isValidPath(expectedStorePath))
-            return expectedStorePath;
+            return store->toRealPath(expectedStorePath);
     }
 
     Path cacheDir = getCacheDir() + "/nix/tarballs";
@@ -687,17 +723,22 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
             Path tmpDir = createTempDir();
             AutoDelete autoDelete(tmpDir, true);
             // FIXME: this requires GNU tar for decompression.
-            runProgram("tar", true, {"xf", storePath, "-C", tmpDir, "--strip-components", "1"});
+            runProgram("tar", true, {"xf", store->toRealPath(storePath), "-C", tmpDir, "--strip-components", "1"});
             unpackedStorePath = store->addToStore(name, tmpDir, true, htSHA256, defaultPathFilter, NoRepair);
         }
         replaceSymlink(unpackedStorePath, unpackedLink);
         storePath = unpackedStorePath;
     }
 
-    if (expectedStorePath != "" && storePath != expectedStorePath)
-        throw nix::Error("store path mismatch in file downloaded from '%s'", url);
+    if (expectedStorePath != "" && storePath != expectedStorePath) {
+        Hash gotHash = unpack
+            ? hashPath(expectedHash.type, store->toRealPath(storePath)).first
+            : hashFile(expectedHash.type, store->toRealPath(storePath));
+        throw nix::Error("hash mismatch in file downloaded from '%s': got hash '%s' instead of the expected hash '%s'",
+            url, gotHash.to_string(), expectedHash.to_string());
+    }
 
-    return storePath;
+    return store->toRealPath(storePath);
 }
 
 

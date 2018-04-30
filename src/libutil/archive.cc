@@ -40,14 +40,14 @@ static void dumpContents(const Path & path, size_t size,
     AutoCloseFD fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (!fd) throw SysError(format("opening file '%1%'") % path);
 
-    unsigned char buf[65536];
+    std::vector<unsigned char> buf(65536);
     size_t left = size;
 
     while (left > 0) {
-        size_t n = left > sizeof(buf) ? sizeof(buf) : left;
-        readFull(fd.get(), buf, n);
+        auto n = std::min(left, buf.size());
+        readFull(fd.get(), buf.data(), n);
         left -= n;
-        sink(buf, n);
+        sink(buf.data(), n);
     }
 
     writePadding(size, sink);
@@ -146,14 +146,14 @@ static void parseContents(ParseSink & sink, Source & source, const Path & path)
     sink.preallocateContents(size);
 
     unsigned long long left = size;
-    unsigned char buf[65536];
+    std::vector<unsigned char> buf(65536);
 
     while (left) {
         checkInterrupt();
-        unsigned int n = sizeof(buf);
-        if ((unsigned long long) n > left) n = left;
-        source(buf, n);
-        sink.receiveContents(buf, n);
+        auto n = buf.size();
+        if ((unsigned long long)n > left) n = left;
+        source(buf.data(), n);
+        sink.receiveContents(buf.data(), n);
         left -= n;
     }
 
@@ -347,6 +347,23 @@ void restorePath(const Path & path, Source & source)
     RestoreSink sink;
     sink.dstPath = path;
     parseDump(sink, source);
+}
+
+
+void copyNAR(Source & source, Sink & sink)
+{
+    // FIXME: if 'source' is the output of dumpPath() followed by EOF,
+    // we should just forward all data directly without parsing.
+
+    ParseSink parseSink; /* null sink; just parse the NAR */
+
+    LambdaSource wrapper([&](unsigned char * data, size_t len) {
+        auto n = source.read(data, len);
+        sink(data, n);
+        return n;
+    });
+
+    parseDump(parseSink, wrapper);
 }
 
 

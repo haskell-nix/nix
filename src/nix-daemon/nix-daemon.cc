@@ -37,13 +37,13 @@ using namespace nix;
 static ssize_t splice(int fd_in, void *off_in, int fd_out, void *off_out, size_t len, unsigned int flags)
 {
     /* We ignore most parameters, we just have them for conformance with the linux syscall */
-    char buf[8192];
-    auto read_count = read(fd_in, buf, sizeof(buf));
+    std::vector<char> buf(8192);
+    auto read_count = read(fd_in, buf.data(), buf.size());
     if (read_count == -1)
         return read_count;
     auto write_count = decltype(read_count)(0);
     while (write_count < read_count) {
-        auto res = write(fd_out, buf + write_count, read_count - write_count);
+        auto res = write(fd_out, buf.data() + write_count, read_count - write_count);
         if (res == -1)
             return res;
         write_count += res;
@@ -411,7 +411,7 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
             /* Repairing is not atomic, so disallowed for "untrusted"
                clients.  */
             if (mode == bmRepair && !trusted)
-                throw Error("repairing is not supported when building through the Nix daemon");
+                throw Error("repairing is not allowed because you are not in 'trusted-users'");
         }
         logger->startWork();
         store->buildPaths(drvs, mode);
@@ -695,7 +695,7 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
         parseDump(tee, tee.source);
 
         logger->startWork();
-        store->addToStore(info, tee.source.data, (RepairFlag) repair,
+        store.cast<Store>()->addToStore(info, tee.source.data, (RepairFlag) repair,
             dontCheckSigs ? NoCheckSigs : CheckSigs, nullptr);
         logger->stopWork();
         break;
@@ -816,8 +816,11 @@ static void processConnection(bool trusted)
 
 static void sigChldHandler(int sigNo)
 {
+    // Ensure we don't modify errno of whatever we've interrupted
+    auto saved_errno = errno;
     /* Reap all dead children. */
     while (waitpid(-1, 0, WNOHANG) > 0) ;
+    errno = saved_errno;
 }
 
 
@@ -994,7 +997,7 @@ static void daemonLoop(char * * argv)
             if (matchUser(user, group, trustedUsers))
                 trusted = true;
 
-            if (!trusted && !matchUser(user, group, allowedUsers))
+            if ((!trusted && !matchUser(user, group, allowedUsers)) || group == settings.buildUsersGroup)
                 throw Error(format("user '%1%' is not allowed to connect to the Nix daemon") % user);
 
             printInfo(format((string) "accepted connection from pid %1%, user %2%" + (trusted ? " (trusted)" : ""))
@@ -1032,7 +1035,7 @@ static void daemonLoop(char * * argv)
             }, options);
 
         } catch (Interrupted & e) {
-            throw;
+            return;
         } catch (Error & e) {
             printError(format("error processing connection: %1%") % e.msg());
         }
@@ -1059,6 +1062,8 @@ int main(int argc, char * * argv)
             else return false;
             return true;
         });
+
+        initPlugins();
 
         if (stdio) {
             if (getStoreType() == tDaemon) {

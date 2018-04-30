@@ -141,7 +141,7 @@ void mainWrapped(int argc, char * * argv)
         else if (*arg == "--version")
             printVersion(myName);
 
-        else if (*arg == "--add-drv-link")
+        else if (*arg == "--add-drv-link" || *arg == "--indirect")
             ; // obsolete
 
         else if (*arg == "--no-out-link" || *arg == "--no-link")
@@ -166,9 +166,6 @@ void mainWrapped(int argc, char * * argv)
             repair = Repair;
             buildMode = bmRepair;
         }
-
-        else if (*arg == "--hash")
-            buildMode = bmHash;
 
         else if (*arg == "--run-env") // obsolete
             runEnv = true;
@@ -215,7 +212,7 @@ void mainWrapped(int argc, char * * argv)
                 // read the shebang to understand which packages to read from. Since
                 // this is handled via nix-shell -p, we wrap our ruby script execution
                 // in ruby -e 'load' which ignores the shebangs.
-                envCommand = (format("exec %1% %2% -e 'load(\"%3%\") -- %4%") % execArgs % interpreter % script % joined.str()).str();
+                envCommand = (format("exec %1% %2% -e 'load(\"%3%\")' -- %4%") % execArgs % interpreter % script % joined.str()).str();
             } else {
                 envCommand = (format("exec %1% %2% %3% %4%") % execArgs % interpreter % script % joined.str()).str();
             }
@@ -234,6 +231,8 @@ void mainWrapped(int argc, char * * argv)
     });
 
     myArgs.parseCmdline(args);
+
+    initPlugins();
 
     if (packages && fromArgs)
         throw UsageError("'-p' and '-E' are mutually exclusive");
@@ -272,15 +271,19 @@ void mainWrapped(int argc, char * * argv)
         exprs = {state.parseStdin()};
     else
         for (auto i : left) {
+            auto absolute = i;
+            try {
+                absolute = canonPath(absPath(i), true);
+            } catch (Error e) {};
             if (fromArgs)
                 exprs.push_back(state.parseExprFromString(i, absPath(".")));
-            else if (store->isStorePath(i) && std::regex_match(i, std::regex(".*\\.drv(!.*)?")))
-                drvs.push_back(DrvInfo(state, store, i));
+            else if (store->isStorePath(absolute) && std::regex_match(absolute, std::regex(".*\\.drv(!.*)?")))
+                drvs.push_back(DrvInfo(state, store, absolute));
             else
                 /* If we're in a #! script, interpret filenames
                    relative to the script. */
-                exprs.push_back(state.parseExprFromFile(resolveExprPath(lookupFileArg(state,
-                    inShebang && !packages ? absPath(i, absPath(dirOf(script))) : i))));
+                exprs.push_back(state.parseExprFromFile(resolveExprPath(state.checkSourcePath(lookupFileArg(state,
+                    inShebang && !packages ? absPath(i, absPath(dirOf(script))) : i)))));
         }
 
     /* Evaluate them into derivations. */

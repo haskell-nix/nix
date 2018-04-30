@@ -59,7 +59,7 @@ static void makeSymlink(const Path & link, const Path & target)
 
     /* Create the new symlink. */
     Path tempLink = (format("%1%.tmp-%2%-%3%")
-        % link % getpid() % rand()).str();
+        % link % getpid() % random()).str();
     createSymlink(target, tempLink);
 
     /* Atomically replace the old one. */
@@ -324,10 +324,8 @@ Roots LocalStore::findRootsNoTemp()
 {
     Roots roots;
 
-    /* Process direct roots in {gcroots,manifests,profiles}. */
+    /* Process direct roots in {gcroots,profiles}. */
     findRoots(stateDir + "/" + gcRootsDir, DT_UNKNOWN, roots);
-    if (pathExists(stateDir + "/manifests"))
-        findRoots(stateDir + "/manifests", DT_UNKNOWN, roots);
     findRoots(stateDir + "/profiles", DT_UNKNOWN, roots);
 
     /* Add additional roots returned by the program specified by the

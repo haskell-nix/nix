@@ -193,9 +193,6 @@ LegacyArgs::LegacyArgs(const std::string & programName,
     mkFlag(0, "readonly-mode", "do not write to the Nix store",
         &settings.readOnlyMode);
 
-    mkFlag(0, "show-trace", "show Nix expression stack trace in evaluation errors",
-        &settings.showTrace);
-
     mkFlag(0, "no-gc-warning", "disable warning about not using '--add-root'",
         &gcWarning, false);
 
@@ -265,7 +262,8 @@ void printVersion(const string & programName)
 void showManPage(const string & name)
 {
     restoreSignals();
-    execlp("man", "man", name.c_str(), NULL);
+    setenv("MANPATH", settings.nixManDir.c_str(), 1);
+    execlp("man", "man", name.c_str(), nullptr);
     throw SysError(format("command 'man %1%' failed") % name.c_str());
 }
 
@@ -327,10 +325,10 @@ RunPager::RunPager()
             setenv("LESS", "FRSXMK", 1);
         restoreSignals();
         if (pager)
-            execl("/bin/sh", "sh", "-c", pager, NULL);
-        execlp("pager", "pager", NULL);
-        execlp("less", "less", NULL);
-        execlp("more", "more", NULL);
+            execl("/bin/sh", "sh", "-c", pager, nullptr);
+        execlp("pager", "pager", nullptr);
+        execlp("less", "less", nullptr);
+        execlp("more", "more", nullptr);
         throw SysError(format("executing '%1%'") % pager);
     });
 

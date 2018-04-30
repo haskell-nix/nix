@@ -69,16 +69,17 @@ public:
     const Symbol sWith, sOutPath, sDrvPath, sType, sMeta, sName, sValue,
         sSystem, sOverrides, sOutputs, sOutputName, sIgnoreNulls,
         sFile, sLine, sColumn, sFunctor, sToString,
-        sRight, sWrong, sStructuredAttrs, sBuilder;
+        sRight, sWrong, sStructuredAttrs, sBuilder, sArgs,
+        sOutputHash, sOutputHashAlgo, sOutputHashMode;
     Symbol sDerivationNix;
 
     /* If set, force copying files to the Nix store even if they
        already exist there. */
     RepairFlag repair;
 
-    /* If set, don't allow access to files outside of the Nix search
-       path or to environment variables. */
-    bool restricted;
+    /* The allowed filesystem paths in restricted or pure evaluation
+       mode. */
+    std::experimental::optional<PathSet> allowedPaths;
 
     Value vEmptySet;
 
@@ -111,6 +112,15 @@ public:
     Path checkSourcePath(const Path & path);
 
     void checkURI(const std::string & uri);
+
+    /* When using a diverted store and 'path' is in the Nix store, map
+       'path' to the diverted location (e.g. /nix/store/foo is mapped
+       to /home/alice/my-nix/nix/store/foo). However, this is only
+       done if the context is not empty, since otherwise we're
+       probably trying to read from the actual /nix/store. This is
+       intended to distinguish between import-from-derivation and
+       sources stored in the actual /nix/store. */
+    Path toRealPath(const Path & path, const PathSet & context);
 
     /* Parse a Nix expression from the specified file. */
     Expr * parseExprFromFile(const Path & path);
@@ -201,9 +211,9 @@ private:
 
     void createBaseEnv();
 
-    void addConstant(const string & name, Value & v);
+    Value * addConstant(const string & name, Value & v);
 
-    void addPrimOp(const string & name,
+    Value * addPrimOp(const string & name,
         unsigned int arity, PrimOpFun primOp);
 
 public:

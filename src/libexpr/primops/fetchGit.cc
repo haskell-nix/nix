@@ -22,10 +22,15 @@ struct GitInfo
     uint64_t revCount = 0;
 };
 
+std::regex revRegex("^[0-9a-fA-F]{40}$");
+
 GitInfo exportGit(ref<Store> store, const std::string & uri,
-    std::experimental::optional<std::string> ref, const std::string & rev,
+    std::experimental::optional<std::string> ref, std::string rev,
     const std::string & name)
 {
+    if (settings.pureEval && rev == "")
+        throw Error("in pure evaluation mode, 'fetchGit' requires a Git revision");
+
     if (!ref && rev == "" && hasPrefix(uri, "/") && pathExists(uri + "/.git")) {
 
         bool clean = true;
@@ -68,20 +73,20 @@ GitInfo exportGit(ref<Store> store, const std::string & uri,
 
             return gitInfo;
         }
+
+        // clean working tree, but no ref or rev specified.  Use 'HEAD'.
+        rev = chomp(runProgram("git", true, { "-C", uri, "rev-parse", "HEAD" }));
+        ref = "HEAD"s;
     }
 
-    if (!ref) ref = "master"s;
+    if (!ref) ref = "HEAD"s;
 
-    if (rev != "") {
-        std::regex revRegex("^[0-9a-fA-F]{40}$");
-        if (!std::regex_match(rev, revRegex))
-            throw Error("invalid Git revision '%s'", rev);
-    }
+    if (rev != "" && !std::regex_match(rev, revRegex))
+        throw Error("invalid Git revision '%s'", rev);
 
     Path cacheDir = getCacheDir() + "/nix/git";
 
     if (!pathExists(cacheDir)) {
-        createDirs(cacheDir);
         runProgram("git", true, { "init", "--bare", cacheDir });
     }
 
@@ -89,32 +94,43 @@ GitInfo exportGit(ref<Store> store, const std::string & uri,
 
     Path localRefFile = cacheDir + "/refs/heads/" + localRef;
 
-    /* If the local ref is older than ‘tarball-ttl’ seconds, do a git
-       fetch to update the local ref to the remote ref. */
+    bool doFetch;
     time_t now = time(0);
-    struct stat st;
-    if (stat(localRefFile.c_str(), &st) != 0 ||
-        st.st_mtime <= now - settings.tarballTtl)
-    {
-        if (rev == "" ||
-            chomp(runProgram(
-                RunOptions("git", { "-C", cacheDir, "cat-file", "-t", rev })
-                .killStderr(true)).second) != "commit")
-        {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("fetching Git repository '%s'", uri));
-
-            // FIXME: git stderr messes up our progress indicator, so
-            // we're using --quiet for now. Should process its stderr.
-            runProgram("git", true, { "-C", cacheDir, "fetch", "--quiet", "--force", "--", uri, *ref + ":" + localRef });
-
-            struct timeval times[2];
-            times[0].tv_sec = now;
-            times[0].tv_usec = 0;
-            times[1].tv_sec = now;
-            times[1].tv_usec = 0;
-
-            utimes(localRefFile.c_str(), times);
+    /* If a rev was specified, we need to fetch if it's not in the
+       repo. */
+    if (rev != "") {
+        try {
+            runProgram("git", true, { "-C", cacheDir, "cat-file", "-e", rev });
+            doFetch = false;
+        } catch (ExecError & e) {
+            if (WIFEXITED(e.status)) {
+                doFetch = true;
+            } else {
+                throw;
+            }
         }
+    } else {
+        /* If the local ref is older than ‘tarball-ttl’ seconds, do a
+           git fetch to update the local ref to the remote ref. */
+        struct stat st;
+        doFetch = stat(localRefFile.c_str(), &st) != 0 ||
+            st.st_mtime + settings.tarballTtl <= now;
+    }
+    if (doFetch)
+    {
+        Activity act(*logger, lvlTalkative, actUnknown, fmt("fetching Git repository '%s'", uri));
+
+        // FIXME: git stderr messes up our progress indicator, so
+        // we're using --quiet for now. Should process its stderr.
+        runProgram("git", true, { "-C", cacheDir, "fetch", "--quiet", "--force", "--", uri, *ref + ":" + localRef });
+
+        struct timeval times[2];
+        times[0].tv_sec = now;
+        times[0].tv_usec = 0;
+        times[1].tv_sec = now;
+        times[1].tv_usec = 0;
+
+        utimes(localRefFile.c_str(), times);
     }
 
     // FIXME: check whether rev is an ancestor of ref.
@@ -122,7 +138,7 @@ GitInfo exportGit(ref<Store> store, const std::string & uri,
     gitInfo.rev = rev != "" ? rev : chomp(readFile(localRefFile));
     gitInfo.shortRev = std::string(gitInfo.rev, 0, 7);
 
-    printTalkative("using revision %s of repo '%s'", uri, gitInfo.rev);
+    printTalkative("using revision %s of repo '%s'", gitInfo.rev, uri);
 
     std::string storeLinkName = hashString(htSHA512, name + std::string("\0"s) + gitInfo.rev).to_string(Base32, false);
     Path storeLink = cacheDir + "/" + storeLinkName + ".link";
@@ -217,6 +233,9 @@ static void prim_fetchGit(EvalState & state, const Pos & pos, Value * * args, Va
     mkString(*state.allocAttr(v, state.symbols.create("shortRev")), gitInfo.shortRev);
     mkInt(*state.allocAttr(v, state.symbols.create("revCount")), gitInfo.revCount);
     v.attrs->sort();
+
+    if (state.allowedPaths)
+        state.allowedPaths->insert(gitInfo.storePath);
 }
 
 static RegisterPrimOp r("fetchGit", 1, prim_fetchGit);

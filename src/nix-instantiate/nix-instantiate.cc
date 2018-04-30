@@ -70,7 +70,7 @@ void processExpr(EvalState & state, const Strings & attrPaths,
                 if (gcRoot == "")
                     printGCWarning();
                 else {
-                    Path rootName = gcRoot;
+                    Path rootName = indirectRoot ? absPath(gcRoot) : gcRoot;
                     if (++rootNr > 1) rootName += "-" + std::to_string(rootNr);
                     auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
                     if (store2)
@@ -151,6 +151,8 @@ int main(int argc, char * * argv)
 
         myArgs.parseCmdline(argvToStrings(argc, argv));
 
+        initPlugins();
+
         if (evalOnly && !wantsReadWrite)
             settings.readOnlyMode = true;
 
@@ -182,7 +184,7 @@ int main(int argc, char * * argv)
         for (auto & i : files) {
             Expr * e = fromArgs
                 ? state.parseExprFromString(i, absPath("."))
-                : state.parseExprFromFile(resolveExprPath(lookupFileArg(state, i)));
+                : state.parseExprFromFile(resolveExprPath(state.checkSourcePath(lookupFileArg(state, i))));
             processExpr(state, attrPaths, parseOnly, strict, autoArgs,
                 evalOnly, outputKind, xmlOutputSourceLocation, e);
         }

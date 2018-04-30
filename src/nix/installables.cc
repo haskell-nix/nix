@@ -30,10 +30,8 @@ Value * SourceExprCommand::getSourceExpr(EvalState & state)
 
     vSourceExpr = state.allocValue();
 
-    if (file != "") {
-        Expr * e = state.parseExprFromFile(resolveExprPath(lookupFileArg(state, file)));
-        state.eval(e, *vSourceExpr);
-    }
+    if (file != "")
+        state.evalFile(lookupFileArg(state, file), *vSourceExpr);
 
     else {
 
@@ -255,7 +253,7 @@ std::shared_ptr<Installable> parseInstallable(
     return installables.front();
 }
 
-Buildables toBuildables(ref<Store> store, RealiseMode mode,
+Buildables build(ref<Store> store, RealiseMode mode,
     std::vector<std::shared_ptr<Installable>> installables)
 {
     if (mode != Build)
@@ -293,7 +291,7 @@ PathSet toStorePaths(ref<Store> store, RealiseMode mode,
 {
     PathSet outPaths;
 
-    for (auto & b : toBuildables(store, mode, installables))
+    for (auto & b : build(store, mode, installables))
         for (auto & output : b.outputs)
             outPaths.insert(output.second);
 

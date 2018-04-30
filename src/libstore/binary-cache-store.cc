@@ -129,10 +129,8 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
 
             auto narAccessor = makeNarAccessor(nar);
 
-            if (accessor_) {
-                accessor_->nars.emplace(info.path, narAccessor);
-                accessor_->addToCache(info.path, *nar);
-            }
+            if (accessor_)
+                accessor_->addToCache(info.path, *nar, narAccessor);
 
             {
                 auto res = jsonRoot.placeholder("root");
@@ -144,16 +142,14 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
     }
 
     else {
-        if (accessor_) {
-            accessor_->nars.emplace(info.path, makeNarAccessor(nar));
-            accessor_->addToCache(info.path, *nar);
-        }
+        if (accessor_)
+            accessor_->addToCache(info.path, *nar, makeNarAccessor(nar));
     }
 
     /* Compress the NAR. */
     narInfo->compression = compression;
     auto now1 = std::chrono::steady_clock::now();
-    auto narCompressed = compress(compression, *nar);
+    auto narCompressed = compress(compression, *nar, parallelCompression);
     auto now2 = std::chrono::steady_clock::now();
     narInfo->fileHash = hashString(htSHA256, *narCompressed);
     narInfo->fileSize = narCompressed->size();
@@ -207,22 +203,18 @@ void BinaryCacheStore::narFromPath(const Path & storePath, Sink & sink)
     stats.narRead++;
     stats.narReadCompressedBytes += nar->size();
 
-    /* Decompress the NAR. FIXME: would be nice to have the remote
-       side do this. */
-    try {
-        nar = decompress(info->compression, *nar);
-    } catch (UnknownCompressionMethod &) {
-        throw Error(format("binary cache path '%s' uses unknown compression method '%s'")
-            % storePath % info->compression);
-    }
+    uint64_t narSize = 0;
 
-    stats.narReadBytes += nar->size();
+    StringSource source(*nar);
 
-    printMsg(lvlTalkative, format("exporting path '%1%' (%2% bytes)") % storePath % nar->size());
+    LambdaSink wrapperSink([&](const unsigned char * data, size_t len) {
+        sink(data, len);
+        narSize += len;
+    });
 
-    assert(nar->size() % 8 == 0);
+    decompress(info->compression, source, wrapperSink);
 
-    sink((unsigned char *) nar->c_str(), nar->size());
+    stats.narReadBytes += narSize;
 }
 
 void BinaryCacheStore::queryPathInfoUncached(const Path & storePath,

@@ -43,13 +43,14 @@ static char * dupString(const char * s)
 }
 
 
+/* Note: Various places expect the allocated memory to be zeroed. */
 static void * allocBytes(size_t n)
 {
     void * p;
 #if HAVE_BOEHMGC
     p = GC_malloc(n);
 #else
-    p = malloc(n);
+    p = calloc(n, 1);
 #endif
     if (!p) throw std::bad_alloc();
     return p;
@@ -293,6 +294,10 @@ EvalState::EvalState(const Strings & _searchPath, ref<Store> store)
     , sWrong(symbols.create("wrong"))
     , sStructuredAttrs(symbols.create("__structuredAttrs"))
     , sBuilder(symbols.create("builder"))
+    , sArgs(symbols.create("args"))
+    , sOutputHash(symbols.create("outputHash"))
+    , sOutputHashAlgo(symbols.create("outputHashAlgo"))
+    , sOutputHashMode(symbols.create("outputHashMode"))
     , repair(NoRepair)
     , store(store)
     , baseEnv(allocEnv(128))
@@ -300,15 +305,24 @@ EvalState::EvalState(const Strings & _searchPath, ref<Store> store)
 {
     countCalls = getEnv("NIX_COUNT_CALLS", "0") != "0";
 
-    restricted = settings.restrictEval;
-
     assert(gcInitialised);
 
     /* Initialise the Nix expression search path. */
-    Strings paths = parseNixPath(getEnv("NIX_PATH", ""));
-    for (auto & i : _searchPath) addToSearchPath(i);
-    for (auto & i : paths) addToSearchPath(i);
-    addToSearchPath("nix=" + settings.nixDataDir + "/nix/corepkgs");
+    if (!settings.pureEval) {
+        Strings paths = parseNixPath(getEnv("NIX_PATH", ""));
+        for (auto & i : _searchPath) addToSearchPath(i);
+        for (auto & i : paths) addToSearchPath(i);
+    }
+    addToSearchPath("nix=" + canonPath(settings.nixDataDir + "/nix/corepkgs", true));
+
+    if (settings.restrictEval || settings.pureEval) {
+        allowedPaths = PathSet();
+        for (auto & i : searchPath) {
+            auto r = resolveSearchPathElem(i);
+            if (!r.first) continue;
+            allowedPaths->insert(r.second);
+        }
+    }
 
     clearValue(vEmptySet);
     vEmptySet.type = tAttrs;
@@ -326,38 +340,36 @@ EvalState::~EvalState()
 
 Path EvalState::checkSourcePath(const Path & path_)
 {
-    if (!restricted) return path_;
+    if (!allowedPaths) return path_;
+
+    bool found = false;
+
+    for (auto & i : *allowedPaths) {
+        if (isDirOrInDir(path_, i)) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+        throw RestrictedPathError("access to path '%1%' is forbidden in restricted mode", path_);
 
     /* Resolve symlinks. */
     debug(format("checking access to '%s'") % path_);
     Path path = canonPath(path_, true);
 
-    for (auto & i : searchPath) {
-        auto r = resolveSearchPathElem(i);
-        if (!r.first) continue;
-        if (path == r.second || isInDir(path, r.second))
+    for (auto & i : *allowedPaths) {
+        if (isDirOrInDir(path, i))
             return path;
     }
 
-    /* To support import-from-derivation, allow access to anything in
-       the store. FIXME: only allow access to paths that have been
-       constructed by this evaluation. */
-    if (store->isInStore(path)) return path;
-
-#if 0
-    /* Hack to support the chroot dependencies of corepkgs (see
-       corepkgs/config.nix.in). */
-    if (path == settings.nixPrefix && isStorePath(settings.nixPrefix))
-        return path;
-#endif
-
-    throw RestrictedPathError(format("access to path '%1%' is forbidden in restricted mode") % path_);
+    throw RestrictedPathError("access to path '%1%' is forbidden in restricted mode", path);
 }
 
 
 void EvalState::checkURI(const std::string & uri)
 {
-    if (!restricted) return;
+    if (!settings.restrictEval) return;
 
     /* 'uri' should be equal to a prefix, or in a subdirectory of a
        prefix. Thus, the prefix https://github.co does not permit
@@ -371,11 +383,33 @@ void EvalState::checkURI(const std::string & uri)
             && (prefix[prefix.size() - 1] == '/' || uri[prefix.size()] == '/')))
             return;
 
+    /* If the URI is a path, then check it against allowedPaths as
+       well. */
+    if (hasPrefix(uri, "/")) {
+        checkSourcePath(uri);
+        return;
+    }
+
+    if (hasPrefix(uri, "file://")) {
+        checkSourcePath(std::string(uri, 7));
+        return;
+    }
+
     throw RestrictedPathError("access to URI '%s' is forbidden in restricted mode", uri);
 }
 
 
-void EvalState::addConstant(const string & name, Value & v)
+Path EvalState::toRealPath(const Path & path, const PathSet & context)
+{
+    // FIXME: check whether 'path' is in 'context'.
+    return
+        !context.empty() && store->isInStore(path)
+        ? store->toRealPath(path)
+        : path;
+};
+
+
+Value * EvalState::addConstant(const string & name, Value & v)
 {
     Value * v2 = allocValue();
     *v2 = v;
@@ -383,12 +417,18 @@ void EvalState::addConstant(const string & name, Value & v)
     baseEnv.values[baseEnvDispl++] = v2;
     string name2 = string(name, 0, 2) == "__" ? string(name, 2) : name;
     baseEnv.values[0]->attrs->push_back(Attr(symbols.create(name2), v2));
+    return v2;
 }
 
 
-void EvalState::addPrimOp(const string & name,
+Value * EvalState::addPrimOp(const string & name,
     unsigned int arity, PrimOpFun primOp)
 {
+    if (arity == 0) {
+        Value v;
+        primOp(*this, noPos, nullptr, v);
+        return addConstant(name, v);
+    }
     Value * v = allocValue();
     string name2 = string(name, 0, 2) == "__" ? string(name, 2) : name;
     Symbol sym = symbols.create(name2);
@@ -397,6 +437,7 @@ void EvalState::addPrimOp(const string & name,
     staticBaseEnv.vars[symbols.create(name)] = baseEnvDispl;
     baseEnv.values[baseEnvDispl++] = v;
     baseEnv.values[0]->attrs->push_back(Attr(sym, v));
+    return v;
 }
 
 
@@ -546,9 +587,7 @@ Env & EvalState::allocEnv(unsigned int size)
     Env * env = (Env *) allocBytes(sizeof(Env) + size * sizeof(Value *));
     env->size = size;
 
-    /* Clear the values because maybeThunk() and lookupVar fromWith expect this. */
-    for (unsigned i = 0; i < size; ++i)
-        env->values[i] = 0;
+    /* We assume that env->values has been cleared by the allocator; maybeThunk() and lookupVar fromWith expect this. */
 
     return *env;
 }
@@ -589,7 +628,7 @@ void EvalState::mkThunk_(Value & v, Expr * expr)
 
 void EvalState::mkPos(Value & v, Pos * pos)
 {
-    if (pos) {
+    if (pos && pos->file.set()) {
         mkAttrs(v, 3);
         mkString(*allocAttr(v, sFile), pos->file);
         mkInt(*allocAttr(v, sLine), pos->line);
@@ -649,8 +688,10 @@ Value * ExprPath::maybeThunk(EvalState & state, Env & env)
 }
 
 
-void EvalState::evalFile(const Path & path, Value & v)
+void EvalState::evalFile(const Path & path_, Value & v)
 {
+    auto path = checkSourcePath(path_);
+
     FileEvalCache::iterator i;
     if ((i = fileEvalCache.find(path)) != fileEvalCache.end()) {
         v = i->second;
@@ -1275,7 +1316,8 @@ void EvalState::concatLists(Value & v, unsigned int nrLists, Value * * lists, co
     auto out = v.listElems();
     for (unsigned int n = 0, pos = 0; n < nrLists; ++n) {
         unsigned int l = lists[n]->listSize();
-        memcpy(out + pos, lists[n]->listElems(), l * sizeof(Value *));
+        if (l)
+            memcpy(out + pos, lists[n]->listElems(), l * sizeof(Value *));
         pos += l;
     }
 }
@@ -1546,7 +1588,7 @@ string EvalState::copyPathToStore(PathSet & context, const Path & path)
         dstPath = srcToStore[path];
     else {
         dstPath = settings.readOnlyMode
-            ? store->computeStorePathForPath(checkSourcePath(path)).first
+            ? store->computeStorePathForPath(baseNameOf(path), checkSourcePath(path)).first
             : store->addToStore(baseNameOf(path), checkSourcePath(path), true, htSHA256, defaultPathFilter, repair);
         srcToStore[path] = dstPath;
         printMsg(lvlChatty, format("copied source '%1%' -> '%2%'")
@@ -1668,10 +1710,13 @@ void EvalState::printStats()
     printMsg(v, format("  time elapsed: %1%") % cpuTime);
     printMsg(v, format("  size of a value: %1%") % sizeof(Value));
     printMsg(v, format("  size of an attr: %1%") % sizeof(Attr));
-    printMsg(v, format("  environments allocated: %1% (%2% bytes)") % nrEnvs % bEnvs);
-    printMsg(v, format("  list elements: %1% (%2% bytes)") % nrListElems % bLists);
+    printMsg(v, format("  environments allocated count: %1%") % nrEnvs);
+    printMsg(v, format("  environments allocated bytes: %1%") % bEnvs);
+    printMsg(v, format("  list elements count: %1%") % nrListElems);
+    printMsg(v, format("  list elements bytes: %1%") % bLists);
     printMsg(v, format("  list concatenations: %1%") % nrListConcats);
-    printMsg(v, format("  values allocated: %1% (%2% bytes)") % nrValues % bValues);
+    printMsg(v, format("  values allocated count: %1%") % nrValues);
+    printMsg(v, format("  values allocated bytes: %1%") % bValues);
     printMsg(v, format("  sets allocated: %1% (%2% bytes)") % nrAttrsets % bAttrsets);
     printMsg(v, format("  right-biased unions: %1%") % nrOpUpdates);
     printMsg(v, format("  values copied in right-biased unions: %1%") % nrOpUpdateValuesCopied);

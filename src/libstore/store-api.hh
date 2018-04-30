@@ -192,7 +192,7 @@ struct ValidPathInfo
 typedef list<ValidPathInfo> ValidPathInfos;
 
 
-enum BuildMode { bmNormal, bmRepair, bmCheck, bmHash };
+enum BuildMode { bmNormal, bmRepair, bmCheck };
 
 
 struct BuildResult
@@ -247,6 +247,8 @@ public:
     const Path storeDir = storeDir_;
 
     const Setting<int> pathInfoCacheSize{this, 65536, "path-info-cache-size", "size of the in-memory store path information cache"};
+
+    const Setting<bool> isTrusted{this, false, "trusted", "whether paths from this store can be used as substitutes even when they lack trusted signatures"};
 
 protected:
 
@@ -305,9 +307,9 @@ public:
     /* This is the preparatory part of addToStore(); it computes the
        store path to which srcPath is to be copied.  Returns the store
        path and the cryptographic hash of the contents of srcPath. */
-    std::pair<Path, Hash> computeStorePathForPath(const Path & srcPath,
-        bool recursive = true, HashType hashAlgo = htSHA256,
-        PathFilter & filter = defaultPathFilter) const;
+    std::pair<Path, Hash> computeStorePathForPath(const string & name,
+        const Path & srcPath, bool recursive = true,
+        HashType hashAlgo = htSHA256, PathFilter & filter = defaultPathFilter) const;
 
     /* Preparatory part of addTextToStore().
 
@@ -397,9 +399,14 @@ public:
     virtual bool wantMassQuery() { return false; }
 
     /* Import a path into the store. */
+    virtual void addToStore(const ValidPathInfo & info, Source & narSource,
+        RepairFlag repair = NoRepair, CheckSigsFlag checkSigs = CheckSigs,
+        std::shared_ptr<FSAccessor> accessor = 0);
+
+    // FIXME: remove
     virtual void addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
         RepairFlag repair = NoRepair, CheckSigsFlag checkSigs = CheckSigs,
-        std::shared_ptr<FSAccessor> accessor = 0) = 0;
+        std::shared_ptr<FSAccessor> accessor = 0);
 
     /* Copy the contents of a path to the store and register the
        validity the resulting path.  The resulting path is returned.
@@ -597,6 +604,11 @@ public:
        "nix-cache-info" file. Lower value means higher priority. */
     virtual int getPriority() { return 0; }
 
+    virtual Path toRealPath(const Path & storePath)
+    {
+        return storePath;
+    }
+
 protected:
 
     Stats stats;
@@ -639,9 +651,10 @@ public:
 
     virtual Path getRealStoreDir() { return storeDir; }
 
-    Path toRealPath(const Path & storePath)
+    Path toRealPath(const Path & storePath) override
     {
-        return getRealStoreDir() + "/" + baseNameOf(storePath);
+        assert(isInStore(storePath));
+        return getRealStoreDir() + "/" + std::string(storePath, storeDir.size() + 1);
     }
 
     std::shared_ptr<std::string> getBuildLog(const Path & path) override;
@@ -698,6 +711,9 @@ void removeTempRoots();
 
    * ‘daemon’: The Nix store accessed via a Unix domain socket
      connection to nix-daemon.
+
+   * ‘unix://<path>’: The Nix store accessed via a Unix domain socket
+     connection to nix-daemon, with the socket located at <path>.
 
    * ‘auto’ or ‘’: Equivalent to ‘local’ or ‘daemon’ depending on
      whether the user has write access to the local Nix

@@ -64,6 +64,8 @@ int main (int argc, char * * argv)
 
         settings.maxBuildJobs.set("1"); // hack to make tests with local?root= work
 
+        initPlugins();
+
         auto store = openStore().cast<LocalStore>();
 
         /* It would be more appropriate to use $XDG_RUNTIME_DIR, since
@@ -96,7 +98,9 @@ int main (int argc, char * * argv)
             source >> drvPath;
             auto requiredFeatures = readStrings<std::set<std::string>>(source);
 
-            auto canBuildLocally = amWilling && (neededSystem == settings.thisSystem);
+            auto canBuildLocally = amWilling
+                &&  (  neededSystem == settings.thisSystem
+                    || settings.extraPlatforms.get().count(neededSystem) > 0);
 
             /* Error ignored here, will be caught later */
             mkdir(currentLoad.c_str(), 0777);
@@ -189,8 +193,10 @@ int main (int argc, char * * argv)
                     storeUri = bestMachine->storeUri;
 
                 } catch (std::exception & e) {
-                    printError("unable to open SSH connection to '%s': %s; trying other available machines...",
-                        bestMachine->storeUri, e.what());
+                    auto msg = chomp(drainFD(5, false));
+                    printError("cannot build on '%s': %s%s",
+                        bestMachine->storeUri, e.what(),
+                        (msg.empty() ? "" : ": " + msg));
                     bestMachine->enabled = false;
                     continue;
                 }
@@ -200,6 +206,8 @@ int main (int argc, char * * argv)
         }
 
 connected:
+        close(5);
+
         std::cerr << "# accept\n" << storeUri << "\n";
 
         auto inputs = readStrings<PathSet>(source);
@@ -218,9 +226,11 @@ connected:
             signal(SIGALRM, old);
         }
 
+        auto substitute = settings.buildersUseSubstitutes ? Substitute : NoSubstitute;
+
         {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("copying dependencies to '%s'", storeUri));
-            copyPaths(store, ref<Store>(sshStore), inputs, NoRepair, NoCheckSigs);
+            copyPaths(store, ref<Store>(sshStore), inputs, NoRepair, NoCheckSigs, substitute);
         }
 
         uploadLock = -1;
@@ -239,8 +249,8 @@ connected:
 
         if (!missing.empty()) {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("copying outputs from '%s'", storeUri));
-            setenv("NIX_HELD_LOCKS", concatStringsSep(" ", missing).c_str(), 1); /* FIXME: ugly */
-            copyPaths(ref<Store>(sshStore), store, missing, NoRepair, NoCheckSigs);
+            store->locksHeld.insert(missing.begin(), missing.end()); /* FIXME: ugly */
+            copyPaths(ref<Store>(sshStore), store, missing, NoRepair, NoCheckSigs, NoSubstitute);
         }
 
         return;

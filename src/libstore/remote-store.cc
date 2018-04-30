@@ -78,9 +78,22 @@ UDSRemoteStore::UDSRemoteStore(const Params & params)
 }
 
 
+UDSRemoteStore::UDSRemoteStore(std::string socket_path, const Params & params)
+    : Store(params)
+    , LocalFSStore(params)
+    , RemoteStore(params)
+    , path(socket_path)
+{
+}
+
+
 std::string UDSRemoteStore::getUri()
 {
-    return "daemon";
+    if (path) {
+        return std::string("unix://") + *path;
+    } else {
+        return "daemon";
+    }
 }
 
 
@@ -98,7 +111,7 @@ ref<RemoteStore::Connection> UDSRemoteStore::openConnection()
         throw SysError("cannot create Unix domain socket");
     closeOnExec(conn->fd.get());
 
-    string socketPath = settings.nixDaemonSocketFile;
+    string socketPath = path ? *path : settings.nixDaemonSocketFile;
 
     struct sockaddr_un addr;
     addr.sun_family = AF_UNIX;
@@ -364,7 +377,7 @@ Path RemoteStore::queryPathFromHashPart(const string & hashPart)
 }
 
 
-void RemoteStore::addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+void RemoteStore::addToStore(const ValidPathInfo & info, Source & source,
     RepairFlag repair, CheckSigsFlag checkSigs, std::shared_ptr<FSAccessor> accessor)
 {
     auto conn(connections->get());
@@ -372,22 +385,21 @@ void RemoteStore::addToStore(const ValidPathInfo & info, const ref<std::string> 
     if (GET_PROTOCOL_MINOR(conn->daemonVersion) < 18) {
         conn->to << wopImportPaths;
 
-        StringSink sink;
-        sink << 1 // == path follows
-            ;
-        assert(nar->size() % 8 == 0);
-        sink((unsigned char *) nar->data(), nar->size());
-        sink
-            << exportMagic
-            << info.path
-            << info.references
-            << info.deriver
-            << 0 // == no legacy signature
-            << 0 // == no path follows
-            ;
+        auto source2 = sinkToSource([&](Sink & sink) {
+            sink << 1 // == path follows
+                ;
+            copyNAR(source, sink);
+            sink
+                << exportMagic
+                << info.path
+                << info.references
+                << info.deriver
+                << 0 // == no legacy signature
+                << 0 // == no path follows
+                ;
+        });
 
-        StringSource source(*sink.s);
-        conn->processStderr(0, &source);
+        conn->processStderr(0, source2.get());
 
         auto importedPaths = readStorePaths<PathSet>(*this, conn->from);
         assert(importedPaths.size() <= 1);
@@ -399,7 +411,7 @@ void RemoteStore::addToStore(const ValidPathInfo & info, const ref<std::string> 
                  << info.references << info.registrationTime << info.narSize
                  << info.ultimate << info.sigs << info.ca
                  << repair << !checkSigs;
-        conn->to(*nar);
+        copyNAR(source, conn->to);
         conn->processStderr();
     }
 }
@@ -721,5 +733,14 @@ void RemoteStore::Connection::processStderr(Sink * sink, Source * source)
     }
 }
 
+static std::string uriScheme = "unix://";
+
+static RegisterStoreImplementation regStore([](
+    const std::string & uri, const Store::Params & params)
+    -> std::shared_ptr<Store>
+{
+    if (std::string(uri, 0, uriScheme.size()) != uriScheme) return 0;
+    return std::make_shared<UDSRemoteStore>(std::string(uri, uriScheme.size()), params);
+});
 
 }

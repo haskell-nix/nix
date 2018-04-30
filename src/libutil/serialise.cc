@@ -5,6 +5,8 @@
 #include <cerrno>
 #include <memory>
 
+#include <boost/coroutine2/coroutine.hpp>
+
 
 namespace nix {
 
@@ -67,7 +69,8 @@ void FdSink::write(const unsigned char * data, size_t len)
     try {
         writeFull(fd, data, len);
     } catch (SysError & e) {
-        _good = true;
+        _good = false;
+        throw;
     }
 }
 
@@ -84,6 +87,23 @@ void Source::operator () (unsigned char * data, size_t len)
         size_t n = read(data, len);
         data += n; len -= n;
     }
+}
+
+
+std::string Source::drain()
+{
+    std::string s;
+    std::vector<unsigned char> buf(8192);
+    while (true) {
+        size_t n;
+        try {
+            n = read(buf.data(), buf.size());
+            s.append((char *) buf.data(), n);
+        } catch (EndOfFile &) {
+            break;
+        }
+    }
+    return s;
 }
 
 
@@ -134,6 +154,50 @@ size_t StringSource::read(unsigned char * data, size_t len)
     size_t n = s.copy((char *) data, len, pos);
     pos += n;
     return n;
+}
+
+
+std::unique_ptr<Source> sinkToSource(std::function<void(Sink &)> fun)
+{
+    struct SinkToSource : Source
+    {
+        typedef boost::coroutines2::coroutine<std::string> coro_t;
+
+        coro_t::pull_type coro;
+
+        SinkToSource(std::function<void(Sink &)> fun)
+            : coro([&](coro_t::push_type & yield) {
+                LambdaSink sink([&](const unsigned char * data, size_t len) {
+                    if (len) yield(std::string((const char *) data, len));
+                });
+                fun(sink);
+            })
+        {
+        }
+
+        std::string cur;
+        size_t pos = 0;
+
+        size_t read(unsigned char * data, size_t len) override
+        {
+            if (!coro)
+                throw EndOfFile("coroutine has finished");
+
+            if (pos == cur.size()) {
+                if (!cur.empty()) coro();
+                cur = coro.get();
+                pos = 0;
+            }
+
+            auto n = std::min(cur.size() - pos, len);
+            memcpy(data, (unsigned char *) cur.data() + pos, n);
+            pos += n;
+
+            return n;
+        }
+    };
+
+    return std::make_unique<SinkToSource>(fun);
 }
 
 

@@ -29,9 +29,16 @@ rev2=$(git -C $repo rev-parse HEAD)
 path=$(nix eval --raw "(builtins.fetchGit file://$repo).outPath")
 [[ $(cat $path/hello) = world ]]
 
+# In pure eval mode, fetchGit without a revision should fail.
+[[ $(nix eval --raw "(builtins.readFile (fetchGit file://$repo + \"/hello\"))") = world ]]
+(! nix eval --pure-eval --raw "(builtins.readFile (fetchGit file://$repo + \"/hello\"))")
+
 # Fetch using an explicit revision hash.
 path2=$(nix eval --raw "(builtins.fetchGit { url = file://$repo; rev = \"$rev2\"; }).outPath")
 [[ $path = $path2 ]]
+
+# In pure eval mode, fetchGit with a revision should succeed.
+[[ $(nix eval --pure-eval --raw "(builtins.readFile (fetchGit { url = file://$repo; rev = \"$rev2\"; } + \"/hello\"))") = world ]]
 
 # Fetch again. This should be cached.
 mv $repo ${repo}-tmp
@@ -86,3 +93,49 @@ git -C $repo commit -m 'Bla3' -a
 
 path4=$(nix eval --tarball-ttl 0 --raw "(builtins.fetchGit file://$repo).outPath")
 [[ $path2 = $path4 ]]
+
+# tarball-ttl should be ignored if we specify a rev
+echo delft > $repo/hello
+git -C $repo add hello
+git -C $repo commit -m 'Bla4'
+rev3=$(git -C $repo rev-parse HEAD)
+nix eval --tarball-ttl 3600 "(builtins.fetchGit { url = $repo; rev = \"$rev3\"; })" >/dev/null
+
+# Update 'path' to reflect latest master
+path=$(nix eval --raw "(builtins.fetchGit file://$repo).outPath")
+
+# Check behavior when non-master branch is used
+git -C $repo checkout $rev2 -b dev
+echo dev > $repo/hello
+
+# File URI uses 'master' unless specified otherwise
+path2=$(nix eval --raw "(builtins.fetchGit file://$repo).outPath")
+[[ $path = $path2 ]]
+
+# Using local path with branch other than 'master' should work when clean or dirty
+path3=$(nix eval --raw "(builtins.fetchGit $repo).outPath")
+# (check dirty-tree handling was used)
+[[ $(nix eval --raw "(builtins.fetchGit $repo).rev") = 0000000000000000000000000000000000000000 ]]
+
+# Committing shouldn't change store path, or switch to using 'master'
+git -C $repo commit -m 'Bla5' -a
+path4=$(nix eval --raw "(builtins.fetchGit $repo).outPath")
+[[ $(cat $path4/hello) = dev ]]
+[[ $path3 = $path4 ]]
+
+# Confirm same as 'dev' branch
+path5=$(nix eval --raw "(builtins.fetchGit { url = $repo; ref = \"dev\"; }).outPath")
+[[ $path3 = $path5 ]]
+
+
+# Nuke the cache
+rm -rf $TEST_HOME/.cache/nix/git
+
+# Try again, but without 'git' on PATH
+NIX=$(command -v nix)
+# This should fail
+(! PATH= $NIX eval --raw "(builtins.fetchGit { url = $repo; ref = \"dev\"; }).outPath" )
+
+# Try again, with 'git' available.  This should work.
+path5=$(nix eval --raw "(builtins.fetchGit { url = $repo; ref = \"dev\"; }).outPath")
+[[ $path3 = $path5 ]]

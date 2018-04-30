@@ -11,7 +11,6 @@ export NIX_LOCALSTATE_DIR=$TEST_ROOT/var
 export NIX_LOG_DIR=$TEST_ROOT/var/log/nix
 export NIX_STATE_DIR=$TEST_ROOT/var/nix
 export NIX_CONF_DIR=$TEST_ROOT/etc
-export NIX_MANIFESTS_DIR=$TEST_ROOT/var/nix/manifests
 export _NIX_TEST_SHARED=$TEST_ROOT/shared
 if [[ -n $NIX_STORE ]]; then
     export _NIX_TEST_NO_SANDBOX=1
@@ -21,6 +20,7 @@ export NIX_REMOTE=$NIX_REMOTE_
 unset NIX_PATH
 export TEST_HOME=$TEST_ROOT/test-home
 export HOME=$TEST_HOME
+unset XDG_CACHE_HOME
 mkdir -p $TEST_HOME
 
 export PATH=@bindir@:$PATH
@@ -31,6 +31,7 @@ export xmllint="@xmllint@"
 export SHELL="@bash@"
 export PAGER=cat
 export HAVE_SODIUM="@HAVE_SODIUM@"
+export HAVE_BROTLI="@HAVE_BROTLI@"
 
 export version=@PACKAGE_VERSION@
 export system=@system@
@@ -83,6 +84,24 @@ killDaemon() {
     kill -9 $pidDaemon
     wait $pidDaemon || true
     trap "" EXIT
+}
+
+canUseSandbox() {
+    if [[ $(uname) != Linux ]]; then return 1; fi
+
+    if [ ! -L /proc/self/ns/user ]; then
+        echo "Kernel doesn't support user namespaces, skipping this test..."
+        return 1
+    fi
+
+    if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+        if [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" != 1 ]; then
+            echo "Unprivileged user namespaces disabled by sysctl, skipping this test..."
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 fail() {

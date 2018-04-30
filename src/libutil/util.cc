@@ -3,6 +3,7 @@
 #include "affinity.hh"
 #include "sync.hh"
 #include "finally.hh"
+#include "serialise.hh"
 
 #include <cctype>
 #include <cerrno>
@@ -70,6 +71,13 @@ std::map<std::string, std::string> getEnv()
         env.emplace(std::string(s, eq), std::string(eq + 1));
     }
     return env;
+}
+
+
+void clearEnv()
+{
+    for (auto & name : getEnv())
+        unsetenv(name.first.c_str());
 }
 
 
@@ -192,6 +200,12 @@ bool isInDir(const Path & path, const Path & dir)
 }
 
 
+bool isDirOrInDir(const Path & path, const Path & dir)
+{
+    return path == dir or isInDir(path, dir);
+}
+
+
 struct stat lstat(const Path & path)
 {
     struct stat st;
@@ -216,16 +230,17 @@ bool pathExists(const Path & path)
 Path readLink(const Path & path)
 {
     checkInterrupt();
+    std::vector<char> buf;
     for (ssize_t bufSize = PATH_MAX/4; true; bufSize += bufSize/2) {
-        char buf[bufSize];
-        ssize_t rlSize = readlink(path.c_str(), buf, bufSize);
+        buf.resize(bufSize);
+        ssize_t rlSize = readlink(path.c_str(), buf.data(), bufSize);
         if (rlSize == -1)
             if (errno == EINVAL)
                 throw Error("'%1%' is not a symlink", path);
             else
                 throw SysError("reading symbolic link '%1%'", path);
         else if (rlSize < bufSize)
-            return string(buf, rlSize);
+            return string(buf.data(), rlSize);
     }
 }
 
@@ -280,10 +295,10 @@ string readFile(int fd)
     if (fstat(fd, &st) == -1)
         throw SysError("statting file");
 
-    auto buf = std::make_unique<unsigned char[]>(st.st_size);
-    readFull(fd, buf.get(), st.st_size);
+    std::vector<unsigned char> buf(st.st_size);
+    readFull(fd, buf.data(), st.st_size);
 
-    return string((char *) buf.get(), st.st_size);
+    return string((char *) buf.data(), st.st_size);
 }
 
 
@@ -425,10 +440,10 @@ Path createTempDir(const Path & tmpRoot, const Path & prefix,
 static Lazy<Path> getHome2([]() {
     Path homeDir = getEnv("HOME");
     if (homeDir.empty()) {
-        char buf[16384];
+        std::vector<char> buf(16384);
         struct passwd pwbuf;
         struct passwd * pw;
-        if (getpwuid_r(getuid(), &pwbuf, buf, sizeof(buf), &pw) != 0
+        if (getpwuid_r(getuid(), &pwbuf, buf.data(), buf.size(), &pw) != 0
             || !pw || !pw->pw_dir || !pw->pw_dir[0])
             throw Error("cannot determine user's home directory");
         homeDir = pw->pw_dir;
@@ -553,21 +568,44 @@ void writeFull(int fd, const string & s, bool allowInterrupts)
 }
 
 
-string drainFD(int fd)
+string drainFD(int fd, bool block)
 {
-    string result;
-    unsigned char buffer[4096];
+    StringSink sink;
+    drainFD(fd, sink, block);
+    return std::move(*sink.s);
+}
+
+
+void drainFD(int fd, Sink & sink, bool block)
+{
+    int saved;
+
+    Finally finally([&]() {
+        if (!block) {
+            if (fcntl(fd, F_SETFL, saved) == -1)
+                throw SysError("making file descriptor blocking");
+        }
+    });
+
+    if (!block) {
+        saved = fcntl(fd, F_GETFL);
+        if (fcntl(fd, F_SETFL, saved | O_NONBLOCK) == -1)
+            throw SysError("making file descriptor non-blocking");
+    }
+
+    std::vector<unsigned char> buf(4096);
     while (1) {
         checkInterrupt();
-        ssize_t rd = read(fd, buffer, sizeof buffer);
+        ssize_t rd = read(fd, buf.data(), buf.size());
         if (rd == -1) {
+            if (!block && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break;
             if (errno != EINTR)
                 throw SysError("reading from file");
         }
         else if (rd == 0) break;
-        else result.append((char *) buffer, rd);
+        else sink(buf.data(), rd);
     }
-    return result;
 }
 
 
@@ -907,20 +945,47 @@ string runProgram(Path program, bool searchPath, const Strings & args,
     return res.second;
 }
 
-std::pair<int, std::string> runProgram(const RunOptions & options)
+std::pair<int, std::string> runProgram(const RunOptions & options_)
+{
+    RunOptions options(options_);
+    StringSink sink;
+    options.standardOut = &sink;
+
+    int status = 0;
+
+    try {
+        runProgram2(options);
+    } catch (ExecError & e) {
+        status = e.status;
+    }
+
+    return {status, std::move(*sink.s)};
+}
+
+void runProgram2(const RunOptions & options)
 {
     checkInterrupt();
 
+    assert(!(options.standardIn && options.input));
+
+    std::unique_ptr<Source> source_;
+    Source * source = options.standardIn;
+
+    if (options.input) {
+        source_ = std::make_unique<StringSource>(*options.input);
+        source = source_.get();
+    }
+
     /* Create a pipe. */
     Pipe out, in;
-    out.create();
-    if (options.input) in.create();
+    if (options.standardOut) out.create();
+    if (source) in.create();
 
     /* Fork. */
     Pid pid = startProcess([&]() {
-        if (dup2(out.writeSide.get(), STDOUT_FILENO) == -1)
+        if (options.standardOut && dup2(out.writeSide.get(), STDOUT_FILENO) == -1)
             throw SysError("dupping stdout");
-        if (options.input && dup2(in.readSide.get(), STDIN_FILENO) == -1)
+        if (source && dup2(in.readSide.get(), STDIN_FILENO) == -1)
             throw SysError("dupping stdin");
 
         Strings args_(options.args);
@@ -948,11 +1013,20 @@ std::pair<int, std::string> runProgram(const RunOptions & options)
     });
 
 
-    if (options.input) {
+    if (source) {
         in.readSide = -1;
         writerThread = std::thread([&]() {
             try {
-                writeFull(in.writeSide.get(), *options.input);
+                std::vector<unsigned char> buf(8 * 1024);
+                while (true) {
+                    size_t n;
+                    try {
+                        n = source->read(buf.data(), buf.size());
+                    } catch (EndOfFile &) {
+                        break;
+                    }
+                    writeFull(in.writeSide.get(), buf.data(), n);
+                }
                 promise.set_value();
             } catch (...) {
                 promise.set_exception(std::current_exception());
@@ -961,15 +1035,17 @@ std::pair<int, std::string> runProgram(const RunOptions & options)
         });
     }
 
-    string result = drainFD(out.readSide.get());
+    if (options.standardOut)
+        drainFD(out.readSide.get(), *options.standardOut);
 
     /* Wait for the child to finish. */
     int status = pid.wait();
 
     /* Wait for the writer thread to finish. */
-    if (options.input) promise.get_future().get();
+    if (source) promise.get_future().get();
 
-    return {status, result};
+    if (status)
+        throw ExecError(status, fmt("program '%1%' %2%", options.program, statusToString(status)));
 }
 
 
@@ -1172,36 +1248,51 @@ void ignoreException()
 }
 
 
-string filterANSIEscapes(const string & s, bool nixOnly)
+std::string filterANSIEscapes(const std::string & s, bool filterAll, unsigned int width)
 {
-    string t, r;
-    enum { stTop, stEscape, stCSI } state = stTop;
-    for (auto c : s) {
-        if (state == stTop) {
-            if (c == '\e') {
-                state = stEscape;
-                r = c;
-            } else
-                t += c;
-        } else if (state == stEscape) {
-            r += c;
-            if (c == '[')
-                state = stCSI;
-            else {
-                t += r;
-                state = stTop;
+    std::string t, e;
+    size_t w = 0;
+    auto i = s.begin();
+
+    while (w < (size_t) width && i != s.end()) {
+
+        if (*i == '\e') {
+            std::string e;
+            e += *i++;
+            char last = 0;
+
+            if (i != s.end() && *i == '[') {
+                e += *i++;
+                // eat parameter bytes
+                while (i != s.end() && *i >= 0x30 && *i <= 0x3f) e += *i++;
+                // eat intermediate bytes
+                while (i != s.end() && *i >= 0x20 && *i <= 0x2f) e += *i++;
+                // eat final byte
+                if (i != s.end() && *i >= 0x40 && *i <= 0x7e) e += last = *i++;
+            } else {
+                if (i != s.end() && *i >= 0x40 && *i <= 0x5f) e += *i++;
             }
-        } else {
-            r += c;
-            if (c >= 0x40 && c <= 0x7e) {
-                if (nixOnly && (c != 'p' && c != 'q' && c != 's' && c != 'a' && c != 'b'))
-                    t += r;
-                state = stTop;
-                r.clear();
+
+            if (!filterAll && last == 'm')
+                t += e;
+        }
+
+        else if (*i == '\t') {
+            i++; t += ' '; w++;
+            while (w < (size_t) width && w % 8) {
+                t += ' '; w++;
             }
         }
+
+        else if (*i == '\r')
+            // do nothing for now
+            i++;
+
+        else {
+            t += *i++; w++;
+        }
     }
-    t += r;
+
     return t;
 }
 

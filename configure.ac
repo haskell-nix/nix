@@ -61,7 +61,8 @@ CFLAGS=
 CXXFLAGS=
 AC_PROG_CC
 AC_PROG_CXX
-AX_CXX_COMPILE_STDCXX_11
+AC_PROG_CPP
+AX_CXX_COMPILE_STDCXX_14
 
 
 # Use 64-bit file system calls so that we can support files > 2 GiB.
@@ -127,7 +128,7 @@ NEED_PROG(gzip, gzip)
 NEED_PROG(xz, xz)
 AC_PATH_PROG(dot, dot)
 AC_PATH_PROG(pv, pv, pv)
-AC_PATH_PROG(bro, bro, bro)
+AC_PATH_PROGS(brotli, brotli bro, bro)
 AC_PATH_PROG(lsof, lsof, lsof)
 
 
@@ -174,22 +175,50 @@ AC_SUBST(HAVE_SODIUM, [$have_sodium])
 
 # Look for liblzma, a required dependency.
 PKG_CHECK_MODULES([LIBLZMA], [liblzma], [CXXFLAGS="$LIBLZMA_CFLAGS $CXXFLAGS"])
+AC_CHECK_LIB([lzma], [lzma_stream_encoder_mt],
+  [AC_DEFINE([HAVE_LZMA_MT], [1], [xz multithreaded compression support])])
 
+
+# Look for libbrotli{enc,dec}, optional dependencies
+PKG_CHECK_MODULES([LIBBROTLI], [libbrotlienc libbrotlidec],
+  [AC_DEFINE([HAVE_BROTLI], [1], [Whether to use libbrotli.])
+   CXXFLAGS="$LIBBROTLI_CFLAGS $CXXFLAGS"]
+   have_brotli=1], [have_brotli=])
+AC_SUBST(HAVE_BROTLI, [$have_brotli])
 
 # Look for libseccomp, required for Linux sandboxing.
 if test "$sys_name" = linux; then
-  PKG_CHECK_MODULES([LIBSECCOMP], [libseccomp],
-                    [CXXFLAGS="$LIBSECCOMP_CFLAGS $CXXFLAGS"])
+  AC_ARG_ENABLE([seccomp-sandboxing],
+                AC_HELP_STRING([--disable-seccomp-sandboxing],
+                               [Don't build support for seccomp sandboxing (only recommended if your arch doesn't support libseccomp yet!)]
+                              ))
+  if test "x$enable_seccomp_sandboxing" != "xno"; then
+    PKG_CHECK_MODULES([LIBSECCOMP], [libseccomp],
+                      [CXXFLAGS="$LIBSECCOMP_CFLAGS $CXXFLAGS"])
+    have_seccomp=1
+    AC_DEFINE([HAVE_SECCOMP], [1], [Whether seccomp is available and should be used for sandboxing.])
+  else
+    have_seccomp=
+  fi
+else
+  have_seccomp=
 fi
+AC_SUBST(HAVE_SECCOMP, [$have_seccomp])
 
 
 # Look for aws-cpp-sdk-s3.
 AC_LANG_PUSH(C++)
 AC_CHECK_HEADERS([aws/s3/S3Client.h],
-  [AC_DEFINE([ENABLE_S3], [1], [Whether to enable S3 support via aws-cpp-sdk-s3.])
+  [AC_DEFINE([ENABLE_S3], [1], [Whether to enable S3 support via aws-sdk-cpp.])
   enable_s3=1], [enable_s3=])
 AC_SUBST(ENABLE_S3, [$enable_s3])
 AC_LANG_POP(C++)
+
+if test -n "$enable_s3"; then
+  declare -a aws_version_tokens=($(printf '#include <aws/core/VersionConfig.h>\nAWS_SDK_VERSION_STRING' | $CPP $CPPFLAGS - | grep -v '^#.*' | sed 's/"//g' | tr '.' ' '))
+  AC_DEFINE_UNQUOTED([AWS_VERSION_MAJOR], ${aws_version_tokens@<:@0@:>@}, [Major version of aws-sdk-cpp.])
+  AC_DEFINE_UNQUOTED([AWS_VERSION_MINOR], ${aws_version_tokens@<:@1@:>@}, [Minor version of aws-sdk-cpp.])
+fi
 
 
 # Whether to use the Boehm garbage collector.

@@ -1,6 +1,5 @@
 makefiles = \
   local.mk \
-  src/boost/format/local.mk \
   src/libutil/local.mk \
   src/libstore/local.mk \
   src/libmain/local.mk \
@@ -13,7 +12,6 @@ makefiles = \
   src/nix-collect-garbage/local.mk \
   src/nix-copy-closure/local.mk \
   src/nix-prefetch-url/local.mk \
-  src/buildenv/local.mk \
   src/resolve-system-dependencies/local.mk \
   src/nix-channel/local.mk \
   src/nix-build/local.mk \
@@ -24,9 +22,10 @@ makefiles = \
   misc/launchd/local.mk \
   misc/upstart/local.mk \
   doc/manual/local.mk \
-  tests/local.mk
+  tests/local.mk \
+  tests/plugins/local.mk
 
-GLOBAL_CXXFLAGS += -std=c++14 -g -Wall -include config.h
+GLOBAL_CXXFLAGS += -g -Wall -include config.h
 
 -include Makefile.config
 

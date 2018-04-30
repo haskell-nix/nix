@@ -122,7 +122,6 @@ static void opRealise(Strings opFlags, Strings opArgs)
         if (i == "--dry-run") dryRun = true;
         else if (i == "--repair") buildMode = bmRepair;
         else if (i == "--check") buildMode = bmCheck;
-        else if (i == "--hash") buildMode = bmHash;
         else if (i == "--ignore-unknown") ignoreUnknown = true;
         else throw UsageError(format("unknown flag '%1%'") % i);
 
@@ -632,6 +631,7 @@ static void opDump(Strings opFlags, Strings opArgs)
     FdSink sink(STDOUT_FILENO);
     string path = *opArgs.begin();
     dumpPath(path, sink);
+    sink.flush();
 }
 
 
@@ -657,6 +657,7 @@ static void opExport(Strings opFlags, Strings opArgs)
 
     FdSink sink(STDOUT_FILENO);
     store->exportPaths(opArgs, sink);
+    sink.flush();
 }
 
 
@@ -1052,6 +1053,8 @@ int main(int argc, char * * argv)
 
             return true;
         });
+
+        initPlugins();
 
         if (!op) throw UsageError("no operation specified");
 

@@ -58,7 +58,7 @@ public:
     void querySubstitutablePathInfos(const PathSet & paths,
         SubstitutablePathInfos & infos) override;
 
-    void addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+    void addToStore(const ValidPathInfo & info, Source & nar,
         RepairFlag repair, CheckSigsFlag checkSigs,
         std::shared_ptr<FSAccessor> accessor) override;
 
@@ -122,11 +122,12 @@ protected:
 
     ref<Pool<Connection>> connections;
 
+    virtual void setOptions(Connection & conn);
+
 private:
 
     std::atomic_bool failed{false};
 
-    void setOptions(Connection & conn);
 };
 
 class UDSRemoteStore : public LocalFSStore, public RemoteStore
@@ -134,6 +135,7 @@ class UDSRemoteStore : public LocalFSStore, public RemoteStore
 public:
 
     UDSRemoteStore(const Params & params);
+    UDSRemoteStore(std::string path, const Params & params);
 
     std::string getUri() override;
 
@@ -145,6 +147,7 @@ private:
     };
 
     ref<RemoteStore::Connection> openConnection() override;
+    std::experimental::optional<std::string> path;
 };
 
 

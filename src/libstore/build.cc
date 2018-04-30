@@ -6,6 +6,7 @@
 #include "archive.hh"
 #include "affinity.hh"
 #include "builtins.hh"
+#include "download.hh"
 #include "finally.hh"
 #include "compression.hh"
 #include "json.hh"
@@ -48,7 +49,9 @@
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
+#if HAVE_SECCOMP
 #include <seccomp.h>
+#endif
 #define pivot_root(new_root, put_old) (syscall(SYS_pivot_root, new_root, put_old))
 #endif
 
@@ -79,7 +82,7 @@ typedef std::shared_ptr<Goal> GoalPtr;
 typedef std::weak_ptr<Goal> WeakGoalPtr;
 
 struct CompareGoalPtrs {
-    bool operator() (const GoalPtr & a, const GoalPtr & b);
+    bool operator() (const GoalPtr & a, const GoalPtr & b) const;
 };
 
 /* Set of goals. */
@@ -153,7 +156,7 @@ public:
         abort();
     }
 
-    void trace(const format & f);
+    void trace(const FormatOrString & fs);
 
     string getName()
     {
@@ -178,7 +181,7 @@ protected:
 };
 
 
-bool CompareGoalPtrs::operator() (const GoalPtr & a, const GoalPtr & b) {
+bool CompareGoalPtrs::operator() (const GoalPtr & a, const GoalPtr & b) const {
     string s1 = a->key();
     string s2 = b->key();
     return s1 < s2;
@@ -414,9 +417,9 @@ void Goal::amDone(ExitCode result)
 }
 
 
-void Goal::trace(const format & f)
+void Goal::trace(const FormatOrString & fs)
 {
-    debug(format("%1%: %2%") % name % f);
+    debug("%1%: %2%", name, fs.s);
 }
 
 
@@ -647,6 +650,11 @@ HookInstance::HookInstance()
 
         /* Use fd 4 for the builder's stdout/stderr. */
         if (dup2(builderOut.writeSide.get(), 4) == -1)
+            throw SysError("dupping builder's stdout/stderr");
+
+        /* Hack: pass the read side of that fd to allow build-remote
+           to read SSH error messages. */
+        if (dup2(builderOut.readSide.get(), 5) == -1)
             throw SysError("dupping builder's stdout/stderr");
 
         Strings args = {
@@ -956,6 +964,8 @@ private:
     }
 
     void done(BuildResult::Status status, const string & msg = "");
+
+    PathSet exportReferences(PathSet storePaths);
 };
 
 
@@ -1123,11 +1133,6 @@ void DerivationGoal::haveDerivation()
         return;
     }
 
-    /* Reject doing a hash build of anything other than a fixed-output
-       derivation. */
-    if (buildMode == bmHash && !drv->isFixedOutput())
-        throw Error("cannot do a hash build of non-fixed-output derivation '%1%'", drvPath);
-
     /* We are first going to try to create the invalid output paths
        through substitutes.  If that doesn't work, we'll build
        them. */
@@ -1191,7 +1196,7 @@ void DerivationGoal::outputsSubstituted()
     for (auto & i : drv->inputSrcs) {
         if (worker.store.isValidPath(i)) continue;
         if (!settings.useSubstitutes)
-            throw Error(format("dependency of '%1%' of '%2%' does not exist, and substitution is disabled")
+            throw Error(format("dependency '%1%' of '%2%' does not exist, and substitution is disabled")
                 % i % drvPath);
         addWaitee(worker.makeSubstitutionGoal(i));
     }
@@ -1319,9 +1324,7 @@ void DerivationGoal::inputsRealised()
     allPaths.insert(inputPaths.begin(), inputPaths.end());
 
     /* Is this a fixed-output derivation? */
-    fixedOutput = true;
-    for (auto & i : drv->outputs)
-        if (i.second.hash == "") fixedOutput = false;
+    fixedOutput = drv->isFixedOutput();
 
     /* Don't repeat fixed-output derivations since they're already
        verified by their output hash.*/
@@ -1340,19 +1343,6 @@ void DerivationGoal::inputsRealised()
 void DerivationGoal::tryToBuild()
 {
     trace("trying to build");
-
-    /* Check for the possibility that some other goal in this process
-       has locked the output since we checked in haveDerivation().
-       (It can't happen between here and the lockPaths() call below
-       because we're not allowing multi-threading.)  If so, put this
-       goal to sleep until another goal finishes, then try again. */
-    for (auto & i : drv->outputs)
-        if (pathIsLockedByMe(worker.store.toRealPath(i.second.path))) {
-            debug(format("putting derivation '%1%' to sleep because '%2%' is locked by another goal")
-                % drvPath % i.second.path);
-            worker.waitForAnyGoal(shared_from_this());
-            return;
-        }
 
     /* Obtain locks on all output paths.  The locks are automatically
        released when we exit this function or Nix crashes.  If we
@@ -1475,7 +1465,7 @@ void replaceValidPath(const Path & storePath, const Path tmpPath)
        tmpPath (the replacement), so we have to move it out of the
        way first.  We'd better not be interrupted here, because if
        we're repairing (say) Glibc, we end up with a broken system. */
-    Path oldPath = (format("%1%.old-%2%-%3%") % storePath % getpid() % rand()).str();
+    Path oldPath = (format("%1%.old-%2%-%3%") % storePath % getpid() % random()).str();
     if (pathExists(storePath))
         rename(storePath.c_str(), oldPath.c_str());
     if (rename(tmpPath.c_str(), storePath.c_str()) == -1)
@@ -1742,22 +1732,23 @@ int childEntry(void * arg)
 }
 
 
-PathSet exportReferences(Store & store, PathSet storePaths)
+PathSet DerivationGoal::exportReferences(PathSet storePaths)
 {
     PathSet paths;
 
     for (auto storePath : storePaths) {
 
         /* Check that the store path is valid. */
-        if (!store.isInStore(storePath))
+        if (!worker.store.isInStore(storePath))
             throw BuildError(format("'exportReferencesGraph' contains a non-store path '%1%'")
                 % storePath);
-        storePath = store.toStorePath(storePath);
-        if (!store.isValidPath(storePath))
-            throw BuildError(format("'exportReferencesGraph' contains an invalid path '%1%'")
-                % storePath);
 
-        store.computeFSClosure(storePath, paths);
+        storePath = worker.store.toStorePath(storePath);
+
+        if (!inputPaths.count(storePath))
+            throw BuildError("cannot export references of path '%s' because it is not in the input closure of the derivation", storePath);
+
+        worker.store.computeFSClosure(storePath, paths);
     }
 
     /* If there are derivations in the graph, then include their
@@ -1768,15 +1759,28 @@ PathSet exportReferences(Store & store, PathSet storePaths)
 
     for (auto & j : paths2) {
         if (isDerivation(j)) {
-            Derivation drv = store.derivationFromPath(j);
+            Derivation drv = worker.store.derivationFromPath(j);
             for (auto & k : drv.outputs)
-                store.computeFSClosure(k.second.path, paths);
+                worker.store.computeFSClosure(k.second.path, paths);
         }
     }
 
     return paths;
 }
 
+static std::once_flag dns_resolve_flag;
+
+static void preloadNSS() {
+    /* builtin:fetchurl can trigger a DNS lookup, which with glibc can trigger a dynamic library load of
+       one of the glibc NSS libraries in a sandboxed child, which will fail unless the library's already
+       been loaded in the parent. So we force a download of an invalid URL to force the NSS machinery to
+       load its lookup libraries in the parent before any child gets a chance to. */
+    std::call_once(dns_resolve_flag, []() {
+        DownloadRequest request("http://this.pre-initializes.the.dns.resolvers.invalid");
+        request.tries = 1; // We only need to do it once, and this also suppresses an annoying warning
+        try { getDownloader()->download(request); } catch (...) {}
+    });
+}
 
 void DerivationGoal::startBuilder()
 {
@@ -1786,6 +1790,9 @@ void DerivationGoal::startBuilder()
             format("a '%1%' is required to build '%3%', but I am a '%2%'")
             % drv->platform % settings.thisSystem % drvPath);
     }
+
+    if (drv->isBuiltin())
+        preloadNSS();
 
 #if __APPLE__
     additionalSandboxProfile = get(drv->env, "__sandboxProfile");
@@ -1810,8 +1817,13 @@ void DerivationGoal::startBuilder()
             useChroot = !fixedOutput && get(drv->env, "__noChroot") != "1";
     }
 
-    if (worker.store.storeDir != worker.store.realStoreDir)
-        useChroot = true;
+    if (worker.store.storeDir != worker.store.realStoreDir) {
+        #if __linux__
+            useChroot = true;
+        #else
+            throw Error("building using a diverted store is not supported on this platform");
+        #endif
+    }
 
     /* If `build-users-group' is not empty, then we have to build as
        one of the members of that group. */
@@ -1873,7 +1885,7 @@ void DerivationGoal::startBuilder()
             /* Write closure info to <fileName>. */
             writeFile(tmpDir + "/" + fileName,
                 worker.store.makeValidityRegistration(
-                    exportReferences(worker.store, {storePath}), false, false));
+                    exportReferences({storePath}), false, false));
         }
     }
 
@@ -2375,7 +2387,7 @@ void DerivationGoal::writeStructuredAttrs()
                     for (auto & p : *i)
                         storePaths.insert(p.get<std::string>());
                     worker.store.pathInfoToJSON(jsonRoot,
-                        exportReferences(worker.store, storePaths), false, true);
+                        exportReferences(storePaths), false, true);
                 }
                 json[i.key()] = nlohmann::json::parse(str.str()); // urgh
             }
@@ -2469,7 +2481,7 @@ void setupSeccomp()
 {
 #if __linux__
     if (!settings.filterSyscalls) return;
-
+#if HAVE_SECCOMP
     scmp_filter_ctx ctx;
 
     if (!(ctx = seccomp_init(SCMP_ACT_ALLOW)))
@@ -2486,6 +2498,10 @@ void setupSeccomp()
     if (settings.thisSystem == "x86_64-linux" &&
         seccomp_arch_add(ctx, SCMP_ARCH_X32) != 0)
         throw SysError("unable to add X32 seccomp architecture");
+
+    if (settings.thisSystem == "aarch64-linux" &&
+        seccomp_arch_add(ctx, SCMP_ARCH_ARM) != 0)
+        printError("unsable to add ARM seccomp architecture; this may result in spurious build failures if running 32-bit ARM processes.");
 
     /* Prevent builders from creating setuid/setgid binaries. */
     for (int perm : { S_ISUID, S_ISGID }) {
@@ -2515,6 +2531,11 @@ void setupSeccomp()
 
     if (seccomp_load(ctx) != 0)
         throw SysError("unable to load seccomp BPF program");
+#else
+    throw Error(
+        "seccomp is not supported on this platform; "
+        "you can bypass this error by setting the option 'filter-syscalls' to false, but note that untrusted builds can then create setuid binaries!");
+#endif
 #endif
 }
 
@@ -2682,8 +2703,8 @@ void DerivationGoal::runChild()
                 } else {
                     if (errno != EINVAL)
                         throw SysError("mounting /dev/pts");
-                    doBind("/dev/pts", "/dev/pts");
-                    doBind("/dev/ptmx", "/dev/ptmx");
+                    doBind("/dev/pts", chrootRootDir + "/dev/pts");
+                    doBind("/dev/ptmx", chrootRootDir + "/dev/ptmx");
                 }
             }
 
@@ -2928,8 +2949,15 @@ void DerivationGoal::runChild()
         if (drv->isBuiltin()) {
             try {
                 logger = makeJSONLogger(*logger);
+
+                BasicDerivation drv2(*drv);
+                for (auto & e : drv2.env)
+                    e.second = rewriteStrings(e.second, inputRewrites);
+
                 if (drv->builder == "builtin:fetchurl")
-                    builtinFetchurl(*drv, netrcData);
+                    builtinFetchurl(drv2, netrcData);
+                else if (drv->builder == "builtin:buildenv")
+                    builtinBuildenv(drv2);
                 else
                     throw Error(format("unsupported builtin function '%1%'") % string(drv->builder, 8));
                 _exit(0);
@@ -2991,6 +3019,8 @@ void DerivationGoal::registerOutputs()
     Path checkSuffix = ".check";
     bool runDiffHook = settings.runDiffHook;
     bool keepPreviousRound = settings.keepFailed || runDiffHook;
+
+    std::exception_ptr delayedException;
 
     /* Check whether the output paths were created, and grep each
        output path to determine what other paths it references.  Also make all
@@ -3066,7 +3096,7 @@ void DerivationGoal::registerOutputs()
         /* Check that fixed-output derivations produced the right
            outputs (i.e., the content hash should match the specified
            hash). */
-        if (i.second.hash != "") {
+        if (fixedOutput) {
 
             bool recursive; Hash h;
             i.second.parseHashInfo(recursive, h);
@@ -3082,27 +3112,34 @@ void DerivationGoal::registerOutputs()
             /* Check the hash. In hash mode, move the path produced by
                the derivation to its content-addressed location. */
             Hash h2 = recursive ? hashPath(h.type, actualPath).first : hashFile(h.type, actualPath);
-            if (buildMode == bmHash) {
-                Path dest = worker.store.makeFixedOutputPath(recursive, h2, drv->env["name"]);
-                printError(format("build produced path '%1%' with %2% hash '%3%'")
-                    % dest % printHashType(h.type) % printHash16or32(h2));
-                if (worker.store.isValidPath(dest))
-                    return;
+
+            Path dest = worker.store.makeFixedOutputPath(recursive, h2, drv->env["name"]);
+
+            if (h != h2) {
+
+                /* Throw an error after registering the path as
+                   valid. */
+                delayedException = std::make_exception_ptr(
+                    BuildError("fixed-output derivation produced path '%s' with %s hash '%s' instead of the expected hash '%s'",
+                        dest, printHashType(h.type), printHash16or32(h2), printHash16or32(h)));
+
                 Path actualDest = worker.store.toRealPath(dest);
+
+                if (worker.store.isValidPath(dest))
+                    std::rethrow_exception(delayedException);
+
                 if (actualPath != actualDest) {
                     PathLocks outputLocks({actualDest});
                     deletePath(actualDest);
                     if (rename(actualPath.c_str(), actualDest.c_str()) == -1)
                         throw SysError(format("moving '%1%' to '%2%'") % actualPath % dest);
                 }
+
                 path = dest;
                 actualPath = actualDest;
-            } else {
-                if (h != h2)
-                    throw BuildError(
-                        format("output path '%1%' has %2% hash '%3%' when '%4%' was expected")
-                        % path % i.second.hashAlgo % printHash16or32(h2) % printHash16or32(h));
             }
+            else
+                assert(path == dest);
 
             info.ca = makeFixedOutputCA(recursive, h2);
         }
@@ -3279,6 +3316,11 @@ void DerivationGoal::registerOutputs()
        paths referenced by each of them.  If there are cycles in the
        outputs, this will fail. */
     worker.store.registerValidPaths(infos);
+
+    /* In case of a fixed-output derivation hash mismatch, throw an
+       exception now that we have registered the output as valid. */
+    if (delayedException)
+        std::rethrow_exception(delayedException);
 }
 
 
@@ -3394,7 +3436,7 @@ void DerivationGoal::flushLine()
     else {
         if (settings.verboseBuild &&
             (settings.printRepeatedBuilds || curRound == 1))
-            printError(filterANSIEscapes(currentLogLine, true));
+            printError(currentLogLine);
         else {
             logTail.push_back(currentLogLine);
             if (logTail.size() > settings.logLines) logTail.pop_front();
@@ -3636,7 +3678,7 @@ void SubstitutionGoal::tryNext()
     /* Update the total expected download size. */
     auto narInfo = std::dynamic_pointer_cast<const NarInfo>(info);
 
-    maintainExpectedNar = std::make_unique<MaintainCount<uint64_t>>(worker.expectedNarSize, narInfo->narSize);
+    maintainExpectedNar = std::make_unique<MaintainCount<uint64_t>>(worker.expectedNarSize, info->narSize);
 
     maintainExpectedDownload =
         narInfo && narInfo->fileSize
@@ -3650,9 +3692,12 @@ void SubstitutionGoal::tryNext()
     /* Bail out early if this substituter lacks a valid
        signature. LocalStore::addToStore() also checks for this, but
        only after we've downloaded the path. */
-    if (worker.store.requireSigs && !info->checkSignatures(worker.store, worker.store.publicKeys)) {
-        printInfo(format("warning: substituter '%s' does not have a valid signature for path '%s'")
-            % sub->getUri() % storePath);
+    if (worker.store.requireSigs
+        && !sub->isTrusted
+        && !info->checkSignatures(worker.store, worker.store.getPublicKeys()))
+    {
+        printError("warning: substituter '%s' does not have a valid signature for path '%s'",
+            sub->getUri(), storePath);
         tryNext();
         return;
     }
@@ -3702,6 +3747,17 @@ void SubstitutionGoal::tryToRun()
         return;
     }
 
+    /* If the store path is already locked (probably by a
+       DerivationGoal), then put this goal to sleep. Note: we don't
+       acquire a lock here since that breaks addToStore(), so below we
+       handle an AlreadyLocked exception from addToStore(). The check
+       here is just an optimisation to prevent having to redo a
+       download due to a locked path. */
+    if (pathIsLockedByMe(worker.store.toRealPath(storePath))) {
+        worker.waitForAWhile(shared_from_this());
+        return;
+    }
+
     maintainRunningSubstitutions = std::make_unique<MaintainCount<uint64_t>>(worker.runningSubstitutions);
     worker.updateProgress();
 
@@ -3718,7 +3774,7 @@ void SubstitutionGoal::tryToRun()
             PushActivity pact(act.id);
 
             copyStorePath(ref<Store>(sub), ref<Store>(worker.store.shared_from_this()),
-                storePath, repair);
+                storePath, repair, sub->isTrusted ? NoCheckSigs : CheckSigs);
 
             promise.set_value();
         } catch (...) {
@@ -3741,8 +3797,14 @@ void SubstitutionGoal::finished()
 
     try {
         promise.get_future().get();
+    } catch (AlreadyLocked & e) {
+        /* Probably a DerivationGoal is already building this store
+           path. Sleep for a while and try again. */
+        state = &SubstitutionGoal::init;
+        worker.waitForAWhile(shared_from_this());
+        return;
     } catch (Error & e) {
-        printInfo(e.msg());
+        printError(e.msg());
 
         /* Try the next substitute. */
         state = &SubstitutionGoal::tryNext;
@@ -4106,10 +4168,10 @@ void Worker::waitForInput()
         assert(goal);
 
         set<int> fds2(j->fds);
+        std::vector<unsigned char> buffer(4096);
         for (auto & k : fds2) {
             if (FD_ISSET(k, &fds)) {
-                unsigned char buffer[4096];
-                ssize_t rd = read(k, buffer, sizeof(buffer));
+                ssize_t rd = read(k, buffer.data(), buffer.size());
                 if (rd == -1) {
                     if (errno != EINTR)
                         throw SysError(format("reading from %1%")
@@ -4121,7 +4183,7 @@ void Worker::waitForInput()
                 } else {
                     printMsg(lvlVomit, format("%1%: read %2% bytes")
                         % goal->getName() % rd);
-                    string data((char *) buffer, rd);
+                    string data((char *) buffer.data(), rd);
                     j->lastOutput = after;
                     goal->handleChildOutput(k, data);
                 }
