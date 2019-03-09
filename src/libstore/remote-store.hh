@@ -14,6 +14,7 @@ class Pid;
 struct FdSink;
 struct FdSource;
 template<typename T> class Pool;
+struct ConnectionHandle;
 
 
 /* FIXME: RemoteStore is a misnomer - should be something like
@@ -40,8 +41,7 @@ public:
     PathSet queryAllValidPaths() override;
 
     void queryPathInfoUncached(const Path & path,
-        std::function<void(std::shared_ptr<ValidPathInfo>)> success,
-        std::function<void(std::exception_ptr exc)> failure) override;
+        Callback<std::shared_ptr<ValidPathInfo>> callback) override;
 
     void queryReferrers(const Path & path, PathSet & referrers) override;
 
@@ -98,12 +98,15 @@ public:
 
     void connect() override;
 
+    unsigned int getProtocol() override;
+
     void flushBadConnections();
 
 protected:
 
     struct Connection
     {
+        AutoCloseFD fd;
         FdSink to;
         FdSource from;
         unsigned int daemonVersion;
@@ -111,7 +114,7 @@ protected:
 
         virtual ~Connection();
 
-        void processStderr(Sink * sink = 0, Source * source = 0);
+        std::exception_ptr processStderr(Sink * sink = 0, Source * source = 0);
     };
 
     ref<Connection> openConnectionWrapper();
@@ -123,6 +126,10 @@ protected:
     ref<Pool<Connection>> connections;
 
     virtual void setOptions(Connection & conn);
+
+    ConnectionHandle getConnection();
+
+    friend struct ConnectionHandle;
 
 private:
 
@@ -140,11 +147,6 @@ public:
     std::string getUri() override;
 
 private:
-
-    struct Connection : RemoteStore::Connection
-    {
-        AutoCloseFD fd;
-    };
 
     ref<RemoteStore::Connection> openConnection() override;
     std::experimental::optional<std::string> path;

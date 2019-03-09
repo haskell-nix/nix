@@ -27,7 +27,7 @@ std::regex commitHashRegex("^[0-9a-fA-F]{40}$");
 HgInfo exportMercurial(ref<Store> store, const std::string & uri,
     std::string rev, const std::string & name)
 {
-    if (settings.pureEval && rev == "")
+    if (evalSettings.pureEval && rev == "")
         throw Error("in pure evaluation mode, 'fetchMercurial' requires a Mercurial revision");
 
     if (rev == "" && hasPrefix(uri, "/") && pathExists(uri + "/.hg")) {
@@ -93,7 +93,22 @@ HgInfo exportMercurial(ref<Store> store, const std::string & uri,
             Activity act(*logger, lvlTalkative, actUnknown, fmt("fetching Mercurial repository '%s'", uri));
 
             if (pathExists(cacheDir)) {
-                runProgram("hg", true, { "pull", "-R", cacheDir, "--", uri });
+                try {
+                    runProgram("hg", true, { "pull", "-R", cacheDir, "--", uri });
+                }
+                catch (ExecError & e){
+                    string transJournal = cacheDir + "/.hg/store/journal";
+                    /* hg throws "abandoned transaction" error only if this file exists */
+                    if (pathExists(transJournal))
+                    {
+                        runProgram("hg", true, { "recover", "-R", cacheDir });
+                        runProgram("hg", true, { "pull", "-R", cacheDir, "--", uri });
+                    }
+                    else 
+                    {
+                        throw ExecError(e.status, fmt("program hg '%1%' ", statusToString(e.status)));
+                    }
+                }
             } else {
                 createDirs(dirOf(cacheDir));
                 runProgram("hg", true, { "clone", "--noupdate", "--", uri, cacheDir });
@@ -183,8 +198,6 @@ static void prim_fetchMercurial(EvalState & state, const Pos & pos, Value * * ar
 
     } else
         url = state.coerceToString(pos, *args[0], context, false, false);
-
-    if (!isUri(url)) url = absPath(url);
 
     // FIXME: git externals probably can be used to bypass the URI
     // whitelist. Ah well.

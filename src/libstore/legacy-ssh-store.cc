@@ -17,6 +17,7 @@ struct LegacySSHStore : public Store
     const Setting<Path> sshKey{this, "", "ssh-key", "path to an SSH private key"};
     const Setting<bool> compress{this, false, "compress", "whether to compress the connection"};
     const Setting<Path> remoteProgram{this, "nix-store", "remote-program", "path to the nix-store executable on the remote system"};
+    const Setting<std::string> remoteStore{this, "", "remote-store", "URI of the store on the remote system"};
 
     // Hack for getting remote build log output.
     const Setting<int> logFD{this, -1, "log-fd", "file descriptor to which SSH's stderr is connected"};
@@ -27,6 +28,7 @@ struct LegacySSHStore : public Store
         FdSink to;
         FdSource from;
         int remoteVersion;
+        bool good = true;
     };
 
     std::string host;
@@ -41,7 +43,7 @@ struct LegacySSHStore : public Store
         , connections(make_ref<Pool<Connection>>(
             std::max(1, (int) maxConnections),
             [this]() { return openConnection(); },
-            [](const ref<Connection> & r) { return true; }
+            [](const ref<Connection> & r) { return r->good; }
             ))
         , master(
             host,
@@ -56,7 +58,9 @@ struct LegacySSHStore : public Store
     ref<Connection> openConnection()
     {
         auto conn = make_ref<Connection>();
-        conn->sshConn = master.startCommand(fmt("%s --serve --write", remoteProgram));
+        conn->sshConn = master.startCommand(
+            fmt("%s --serve --write", remoteProgram)
+            + (remoteStore.get() == "" ? "" : " --store " + shellEscape(remoteStore.get())));
         conn->to = FdSink(conn->sshConn->in.get());
         conn->from = FdSource(conn->sshConn->out.get());
 
@@ -84,10 +88,9 @@ struct LegacySSHStore : public Store
     }
 
     void queryPathInfoUncached(const Path & path,
-        std::function<void(std::shared_ptr<ValidPathInfo>)> success,
-        std::function<void(std::exception_ptr exc)> failure) override
+        Callback<std::shared_ptr<ValidPathInfo>> callback) override
     {
-        sync2async<std::shared_ptr<ValidPathInfo>>(success, failure, [&]() -> std::shared_ptr<ValidPathInfo> {
+        try {
             auto conn(connections->get());
 
             debug("querying remote host '%s' for info on '%s'", host, path);
@@ -97,7 +100,7 @@ struct LegacySSHStore : public Store
 
             auto info = std::make_shared<ValidPathInfo>();
             conn->from >> info->path;
-            if (info->path.empty()) return nullptr;
+            if (info->path.empty()) return callback(nullptr);
             assert(path == info->path);
 
             PathSet references;
@@ -116,8 +119,8 @@ struct LegacySSHStore : public Store
             auto s = readString(conn->from);
             assert(s == "");
 
-            return info;
-        });
+            callback(std::move(info));
+        } catch (...) { callback.rethrow(); }
     }
 
     void addToStore(const ValidPathInfo & info, Source & source,
@@ -128,18 +131,48 @@ struct LegacySSHStore : public Store
 
         auto conn(connections->get());
 
-        conn->to
-            << cmdImportPaths
-            << 1;
-        copyNAR(source, conn->to);
-        conn->to
-            << exportMagic
-            << info.path
-            << info.references
-            << info.deriver
-            << 0
-            << 0;
-        conn->to.flush();
+        if (GET_PROTOCOL_MINOR(conn->remoteVersion) >= 5) {
+
+            conn->to
+                << cmdAddToStoreNar
+                << info.path
+                << info.deriver
+                << info.narHash.to_string(Base16, false)
+                << info.references
+                << info.registrationTime
+                << info.narSize
+                << info.ultimate
+                << info.sigs
+                << info.ca;
+            try {
+                copyNAR(source, conn->to);
+            } catch (...) {
+                conn->good = false;
+                throw;
+            }
+            conn->to.flush();
+
+        } else {
+
+            conn->to
+                << cmdImportPaths
+                << 1;
+            try {
+                copyNAR(source, conn->to);
+            } catch (...) {
+                conn->good = false;
+                throw;
+            }
+            conn->to
+                << exportMagic
+                << info.path
+                << info.references
+                << info.deriver
+                << 0
+                << 0;
+            conn->to.flush();
+
+        }
 
         if (readInt(conn->from) != 1)
             throw Error("failed to add path '%s' to remote host '%s', info.path, host");
@@ -154,28 +187,17 @@ struct LegacySSHStore : public Store
         copyNAR(conn->from, sink);
     }
 
-    PathSet queryAllValidPaths() override { unsupported(); }
-
-    void queryReferrers(const Path & path, PathSet & referrers) override
-    { unsupported(); }
-
-    PathSet queryDerivationOutputs(const Path & path) override
-    { unsupported(); }
-
-    StringSet queryDerivationOutputNames(const Path & path) override
-    { unsupported(); }
-
     Path queryPathFromHashPart(const string & hashPart) override
-    { unsupported(); }
+    { unsupported("queryPathFromHashPart"); }
 
     Path addToStore(const string & name, const Path & srcPath,
         bool recursive, HashType hashAlgo,
         PathFilter & filter, RepairFlag repair) override
-    { unsupported(); }
+    { unsupported("addToStore"); }
 
     Path addTextToStore(const string & name, const string & s,
         const PathSet & references, RepairFlag repair) override
-    { unsupported(); }
+    { unsupported("addTextToStore"); }
 
     BuildResult buildDerivation(const Path & drvPath, const BasicDerivation & drv,
         BuildMode buildMode) override
@@ -209,25 +231,7 @@ struct LegacySSHStore : public Store
     }
 
     void ensurePath(const Path & path) override
-    { unsupported(); }
-
-    void addTempRoot(const Path & path) override
-    { unsupported(); }
-
-    void addIndirectRoot(const Path & path) override
-    { unsupported(); }
-
-    Roots findRoots() override
-    { unsupported(); }
-
-    void collectGarbage(const GCOptions & options, GCResults & results) override
-    { unsupported(); }
-
-    ref<FSAccessor> getFSAccessor() override
-    { unsupported(); }
-
-    void addSignatures(const Path & storePath, const StringSet & sigs) override
-    { unsupported(); }
+    { unsupported("ensurePath"); }
 
     void computeFSClosure(const PathSet & paths,
         PathSet & out, bool flipDirection = false,
@@ -269,6 +273,12 @@ struct LegacySSHStore : public Store
     void connect() override
     {
         auto conn(connections->get());
+    }
+
+    unsigned int getProtocol() override
+    {
+        auto conn(connections->get());
+        return conn->remoteVersion;
     }
 };
 

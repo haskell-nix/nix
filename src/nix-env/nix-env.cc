@@ -13,6 +13,7 @@
 #include "json.hh"
 #include "value-to-json.hh"
 #include "xml-writer.hh"
+#include "legacy.hh"
 
 #include <cerrno>
 #include <ctime>
@@ -150,10 +151,8 @@ static void loadSourceExpr(EvalState & state, const Path & path, Value & v)
     if (stat(path.c_str(), &st) == -1)
         throw SysError(format("getting information about '%1%'") % path);
 
-    if (isNixExpr(path, st)) {
+    if (isNixExpr(path, st))
         state.evalFile(path, v);
-        return;
-    }
 
     /* The path is a directory.  Put the Nix expressions in the
        directory in a set, with the file name of each expression as
@@ -161,13 +160,15 @@ static void loadSourceExpr(EvalState & state, const Path & path, Value & v)
        set flat, not nested, to make it easier for a user to have a
        ~/.nix-defexpr directory that includes some system-wide
        directory). */
-    if (S_ISDIR(st.st_mode)) {
+    else if (S_ISDIR(st.st_mode)) {
         state.mkAttrs(v, 1024);
         state.mkList(*state.allocAttr(v, state.symbols.create("_combineChannels")), 0);
         StringSet attrs;
         getAllExprs(state, path, attrs, v);
         v.attrs->sort();
     }
+
+    else throw Error("path '%s' is not a directory or a Nix expression", path);
 }
 
 
@@ -198,13 +199,13 @@ static Path getDefNixExprPath()
 }
 
 
-static int getPriority(EvalState & state, DrvInfo & drv)
+static long getPriority(EvalState & state, DrvInfo & drv)
 {
     return drv.queryMetaInt("priority", 0);
 }
 
 
-static int comparePriorities(EvalState & state, DrvInfo & drv1, DrvInfo & drv2)
+static long comparePriorities(EvalState & state, DrvInfo & drv1, DrvInfo & drv2)
 {
     return getPriority(state, drv2) - getPriority(state, drv1);
 }
@@ -270,7 +271,7 @@ static DrvInfos filterBySelector(EvalState & state, const DrvInfos & allElems,
 
             for (auto & j : matches) {
                 DrvName drvName(j.first.queryName());
-                int d = 1;
+                long d = 1;
 
                 Newest::iterator k = newest.find(drvName.name);
 
@@ -578,7 +579,7 @@ static void upgradeDerivations(Globals & globals,
                             (upgradeType == utEq && d == 0) ||
                             upgradeType == utAlways)
                         {
-                            int d2 = -1;
+                            long d2 = -1;
                             if (bestElem != availElems.end()) {
                                 d2 = comparePriorities(*globals.state, *bestElem, *j);
                                 if (d2 == 0) d2 = compareVersions(bestVersion, newName.version);
@@ -784,22 +785,22 @@ typedef list<Strings> Table;
 
 void printTable(Table & table)
 {
-    unsigned int nrColumns = table.size() > 0 ? table.front().size() : 0;
+    auto nrColumns = table.size() > 0 ? table.front().size() : 0;
 
-    vector<unsigned int> widths;
+    vector<size_t> widths;
     widths.resize(nrColumns);
 
     for (auto & i : table) {
         assert(i.size() == nrColumns);
         Strings::iterator j;
-        unsigned int column;
+        size_t column;
         for (j = i.begin(), column = 0; j != i.end(); ++j, ++column)
             if (j->size() > widths[column]) widths[column] = j->size();
     }
 
     for (auto & i : table) {
         Strings::iterator j;
-        unsigned int column;
+        size_t column;
         for (j = i.begin(), column = 0; j != i.end(); ++j, ++column) {
             string s = *j;
             replace(s.begin(), s.end(), '\n', ' ');
@@ -1284,6 +1285,14 @@ static void opDeleteGenerations(Globals & globals, Strings opFlags, Strings opAr
         deleteOldGenerations(globals.profile, globals.dryRun);
     } else if (opArgs.size() == 1 && opArgs.front().find('d') != string::npos) {
         deleteGenerationsOlderThan(globals.profile, opArgs.front(), globals.dryRun);
+    } else if (opArgs.size() == 1 && opArgs.front().find('+') != string::npos) {
+        if(opArgs.front().size() < 2)
+            throw Error(format("invalid number of generations ‘%1%’") % opArgs.front());
+        string str_max = string(opArgs.front(), 1, opArgs.front().size());
+        int max;
+        if (!string2Int(str_max, max) || max == 0)
+            throw Error(format("invalid number of generations to keep ‘%1%’") % opArgs.front());
+        deleteGenerationsGreaterThan(globals.profile, max, globals.dryRun);
     } else {
         std::set<unsigned int> gens;
         for (auto & i : opArgs) {
@@ -1303,12 +1312,9 @@ static void opVersion(Globals & globals, Strings opFlags, Strings opArgs)
 }
 
 
-int main(int argc, char * * argv)
+static int _main(int argc, char * * argv)
 {
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-        initGC();
-
+    {
         Strings opFlags, opArgs;
         Operation op = 0;
         RepairFlag repair = NoRepair;
@@ -1420,5 +1426,9 @@ int main(int argc, char * * argv)
         op(globals, opFlags, opArgs);
 
         globals.state->printStats();
-    });
+
+        return 0;
+    }
 }
+
+static RegisterLegacyCommand s1("nix-env", _main);

@@ -167,7 +167,7 @@ Path dirOf(const Path & path)
 {
     Path::size_type pos = path.rfind('/');
     if (pos == string::npos)
-        throw Error(format("invalid file name '%1%'") % path);
+        return ".";
     return pos == 0 ? "/" : Path(path, 0, pos);
 }
 
@@ -202,7 +202,7 @@ bool isInDir(const Path & path, const Path & dir)
 
 bool isDirOrInDir(const Path & path, const Path & dir)
 {
-    return path == dir or isInDir(path, dir);
+    return path == dir || isInDir(path, dir);
 }
 
 
@@ -311,12 +311,37 @@ string readFile(const Path & path, bool drain)
 }
 
 
+void readFile(const Path & path, Sink & sink)
+{
+    AutoCloseFD fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (!fd) throw SysError("opening file '%s'", path);
+    drainFD(fd.get(), sink);
+}
+
+
 void writeFile(const Path & path, const string & s, mode_t mode)
 {
     AutoCloseFD fd = open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, mode);
     if (!fd)
         throw SysError(format("opening file '%1%'") % path);
     writeFull(fd.get(), s);
+}
+
+
+void writeFile(const Path & path, Source & source, mode_t mode)
+{
+    AutoCloseFD fd = open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, mode);
+    if (!fd)
+        throw SysError(format("opening file '%1%'") % path);
+
+    std::vector<unsigned char> buf(64 * 1024);
+
+    while (true) {
+        try {
+            auto n = source.read(buf.data(), buf.size());
+            writeFull(fd.get(), (unsigned char *) buf.data(), n);
+        } catch (EndOfFile &) { break; }
+    }
 }
 
 
@@ -443,7 +468,7 @@ static Lazy<Path> getHome2([]() {
         std::vector<char> buf(16384);
         struct passwd pwbuf;
         struct passwd * pw;
-        if (getpwuid_r(getuid(), &pwbuf, buf.data(), buf.size(), &pw) != 0
+        if (getpwuid_r(geteuid(), &pwbuf, buf.data(), buf.size(), &pw) != 0
             || !pw || !pw->pw_dir || !pw->pw_dir[0])
             throw Error("cannot determine user's home directory");
         homeDir = pw->pw_dir;
@@ -469,6 +494,15 @@ Path getConfigDir()
     if (configDir.empty())
         configDir = getHome() + "/.config";
     return configDir;
+}
+
+std::vector<Path> getConfigDirs()
+{
+    Path configHome = getConfigDir();
+    string configDirs = getEnv("XDG_CONFIG_DIRS");
+    std::vector<Path> result = tokenizeString<std::vector<string>>(configDirs, ":");
+    result.insert(result.begin(), configHome);
+    return result;
 }
 
 
@@ -593,7 +627,7 @@ void drainFD(int fd, Sink & sink, bool block)
             throw SysError("making file descriptor non-blocking");
     }
 
-    std::vector<unsigned char> buf(4096);
+    std::vector<unsigned char> buf(64 * 1024);
     while (1) {
         checkInterrupt();
         ssize_t rd = read(fd, buf.data(), buf.size());

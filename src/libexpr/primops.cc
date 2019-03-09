@@ -73,7 +73,7 @@ void EvalState::realiseContext(const PathSet & context)
 
     if (drvs.empty()) return;
 
-    if (!settings.enableImportFromDerivation)
+    if (!evalSettings.enableImportFromDerivation)
         throw EvalError(format("attempted to realize '%1%' during evaluation but 'allow-import-from-derivation' is false") % *(drvs.begin()));
 
     /* For performance, prefetch all substitute info. */
@@ -464,7 +464,7 @@ static void prim_tryEval(EvalState & state, const Pos & pos, Value * * args, Val
 static void prim_getEnv(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
     string name = state.forceStringNoCtx(*args[0], pos);
-    mkString(v, settings.restrictEval || settings.pureEval ? "" : getEnv(name));
+    mkString(v, evalSettings.restrictEval || evalSettings.pureEval ? "" : getEnv(name));
 }
 
 
@@ -687,20 +687,11 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
             }
         }
 
-        /* See prim_unsafeDiscardOutputDependency. */
-        else if (path.at(0) == '~')
-            drv.inputSrcs.insert(string(path, 1));
-
         /* Handle derivation outputs of the form ‘!<name>!<path>’. */
         else if (path.at(0) == '!') {
             std::pair<string, string> ctx = decodeContext(path);
             drv.inputDrvs[ctx.first].insert(ctx.second);
         }
-
-        /* Handle derivation contexts returned by
-           ‘builtins.storePath’. */
-        else if (isDerivation(path))
-            drv.inputDrvs[path] = state.store->queryDerivationOutputNames(path);
 
         /* Otherwise it's a source file. */
         else
@@ -724,16 +715,14 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
         if (outputs.size() != 1 || *(outputs.begin()) != "out")
             throw Error(format("multiple outputs are not supported in fixed-output derivations, at %1%") % posDrvName);
 
-        HashType ht = parseHashType(outputHashAlgo);
-        if (ht == htUnknown)
-            throw EvalError(format("unknown hash algorithm '%1%', at %2%") % outputHashAlgo % posDrvName);
+        HashType ht = outputHashAlgo.empty() ? htUnknown : parseHashType(outputHashAlgo);
         Hash h(*outputHash, ht);
-        outputHash = h.to_string(Base16, false);
-        if (outputHashRecursive) outputHashAlgo = "r:" + outputHashAlgo;
 
         Path outPath = state.store->makeFixedOutputPath(outputHashRecursive, h, drvName);
         if (!jsonObject) drv.env["out"] = outPath;
-        drv.outputs["out"] = DerivationOutput(outPath, outputHashAlgo, *outputHash);
+        drv.outputs["out"] = DerivationOutput(outPath,
+            (outputHashRecursive ? "r:" : "") + printHashType(h.type),
+            h.to_string(Base16, false));
     }
 
     else {
@@ -866,7 +855,7 @@ static void prim_baseNameOf(EvalState & state, const Pos & pos, Value * * args, 
 static void prim_dirOf(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
     PathSet context;
-    Path dir = dirOf(state.coerceToPath(pos, *args[0], context));
+    Path dir = dirOf(state.coerceToString(pos, *args[0], context, false, false));
     if (args[0]->type == tPath) mkPath(v, dir.c_str()); else mkString(v, dir, context);
 }
 
@@ -1006,13 +995,8 @@ static void prim_toFile(EvalState & state, const Pos & pos, Value * * args, Valu
     PathSet refs;
 
     for (auto path : context) {
-        if (path.at(0) == '=') path = string(path, 1);
-        if (isDerivation(path)) {
-            /* See prim_unsafeDiscardOutputDependency. */
-            if (path.at(0) != '~')
-                throw EvalError(format("in 'toFile': the file '%1%' cannot refer to derivation outputs, at %2%") % name % pos);
-            path = string(path, 1);
-        }
+        if (path.at(0) != '/')
+            throw EvalError(format("in 'toFile': the file '%1%' cannot refer to derivation outputs, at %2%") % name % pos);
         refs.insert(path);
     }
 
@@ -1031,7 +1015,7 @@ static void prim_toFile(EvalState & state, const Pos & pos, Value * * args, Valu
 static void addPath(EvalState & state, const Pos & pos, const string & name, const Path & path_,
     Value * filterFun, bool recursive, const Hash & expectedHash, Value & v)
 {
-    const auto path = settings.pureEval && expectedHash ?
+    const auto path = evalSettings.pureEval && expectedHash ?
         path_ :
         state.checkSourcePath(path_);
     PathFilter filter = filterFun ? ([&](const Path & path) {
@@ -1356,6 +1340,24 @@ static void prim_functionArgs(EvalState & state, const Pos & pos, Value * * args
 }
 
 
+/* Apply a function to every element of an attribute set. */
+static void prim_mapAttrs(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    state.forceAttrs(*args[1], pos);
+
+    state.mkAttrs(v, args[1]->attrs->size());
+
+    for (auto & i : *args[1]->attrs) {
+        Value * vName = state.allocValue();
+        Value * vFun2 = state.allocValue();
+        mkString(*vName, i.name);
+        mkApp(*vFun2, *args[0], *vName);
+        mkApp(*state.allocAttr(v, i.name), *vFun2, *i.value);
+    }
+}
+
+
+
 /*************************************************************
  * Lists
  *************************************************************/
@@ -1410,7 +1412,6 @@ static void prim_tail(EvalState & state, const Pos & pos, Value * * args, Value 
 /* Apply a function to every element of a list. */
 static void prim_map(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
-    state.forceFunction(*args[0], pos);
     state.forceList(*args[1], pos);
 
     state.mkList(v, args[1]->listSize());
@@ -1489,19 +1490,20 @@ static void prim_foldlStrict(EvalState & state, const Pos & pos, Value * * args,
     state.forceFunction(*args[0], pos);
     state.forceList(*args[2], pos);
 
-    Value * vCur = args[1];
+    if (args[2]->listSize()) {
+        Value * vCur = args[1];
 
-    if (args[2]->listSize())
         for (unsigned int n = 0; n < args[2]->listSize(); ++n) {
             Value vTmp;
             state.callFunction(*args[0], *vCur, vTmp, pos);
             vCur = n == args[2]->listSize() - 1 ? &v : state.allocValue();
             state.callFunction(vTmp, *args[2]->listElems()[n], *vCur, pos);
         }
-    else
-        v = *vCur;
-
-    state.forceValue(v);
+        state.forceValue(v);
+    } else {
+        state.forceValue(*args[1]);
+        v = *args[1];
+    }
 }
 
 
@@ -1538,7 +1540,6 @@ static void prim_all(EvalState & state, const Pos & pos, Value * * args, Value &
 
 static void prim_genList(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
-    state.forceFunction(*args[0], pos);
     auto len = state.forceInt(*args[1], pos);
 
     if (len < 0)
@@ -1627,6 +1628,35 @@ static void prim_partition(EvalState & state, const Pos & pos, Value * * args, V
 }
 
 
+/* concatMap = f: list: concatLists (map f list); */
+/* C++-version is to avoid allocating `mkApp', call `f' eagerly */
+static void prim_concatMap(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    state.forceFunction(*args[0], pos);
+    state.forceList(*args[1], pos);
+    auto nrLists = args[1]->listSize();
+
+    Value lists[nrLists];
+    size_t len = 0;
+
+    for (unsigned int n = 0; n < nrLists; ++n) {
+        Value * vElem = args[1]->listElems()[n];
+        state.callFunction(*args[0], *vElem, lists[n], pos);
+        state.forceList(lists[n], pos);
+        len += lists[n].listSize();
+    }
+
+    state.mkList(v, len);
+    auto out = v.listElems();
+    for (unsigned int n = 0, pos = 0; n < nrLists; ++n) {
+        auto l = lists[n].listSize();
+        if (l)
+            memcpy(out + pos, lists[n].listElems(), l * sizeof(Value *));
+        pos += l;
+    }
+}
+
+
 /*************************************************************
  * Integer arithmetic
  *************************************************************/
@@ -1634,6 +1664,8 @@ static void prim_partition(EvalState & state, const Pos & pos, Value * * args, V
 
 static void prim_add(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
+    state.forceValue(*args[0], pos);
+    state.forceValue(*args[1], pos);
     if (args[0]->type == tFloat || args[1]->type == tFloat)
         mkFloat(v, state.forceFloat(*args[0], pos) + state.forceFloat(*args[1], pos));
     else
@@ -1643,6 +1675,8 @@ static void prim_add(EvalState & state, const Pos & pos, Value * * args, Value &
 
 static void prim_sub(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
+    state.forceValue(*args[0], pos);
+    state.forceValue(*args[1], pos);
     if (args[0]->type == tFloat || args[1]->type == tFloat)
         mkFloat(v, state.forceFloat(*args[0], pos) - state.forceFloat(*args[1], pos));
     else
@@ -1652,6 +1686,8 @@ static void prim_sub(EvalState & state, const Pos & pos, Value * * args, Value &
 
 static void prim_mul(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
+    state.forceValue(*args[0], pos);
+    state.forceValue(*args[1], pos);
     if (args[0]->type == tFloat || args[1]->type == tFloat)
         mkFloat(v, state.forceFloat(*args[0], pos) * state.forceFloat(*args[1], pos));
     else
@@ -1661,6 +1697,9 @@ static void prim_mul(EvalState & state, const Pos & pos, Value * * args, Value &
 
 static void prim_div(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
+    state.forceValue(*args[0], pos);
+    state.forceValue(*args[1], pos);
+
     NixFloat f2 = state.forceFloat(*args[1], pos);
     if (f2 == 0) throw EvalError(format("division by zero, at %1%") % pos);
 
@@ -1676,6 +1715,20 @@ static void prim_div(EvalState & state, const Pos & pos, Value * * args, Value &
     }
 }
 
+static void prim_bitAnd(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    mkInt(v, state.forceInt(*args[0], pos) & state.forceInt(*args[1], pos));
+}
+
+static void prim_bitOr(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    mkInt(v, state.forceInt(*args[0], pos) | state.forceInt(*args[1], pos));
+}
+
+static void prim_bitXor(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    mkInt(v, state.forceInt(*args[0], pos) ^ state.forceInt(*args[1], pos));
+}
 
 static void prim_lessThan(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
@@ -1724,41 +1777,6 @@ static void prim_stringLength(EvalState & state, const Pos & pos, Value * * args
     PathSet context;
     string s = state.coerceToString(pos, *args[0], context);
     mkInt(v, s.size());
-}
-
-
-static void prim_unsafeDiscardStringContext(EvalState & state, const Pos & pos, Value * * args, Value & v)
-{
-    PathSet context;
-    string s = state.coerceToString(pos, *args[0], context);
-    mkString(v, s, PathSet());
-}
-
-
-static void prim_hasContext(EvalState & state, const Pos & pos, Value * * args, Value & v)
-{
-    PathSet context;
-    state.forceString(*args[0], context, pos);
-    mkBool(v, !context.empty());
-}
-
-
-/* Sometimes we want to pass a derivation path (i.e. pkg.drvPath) to a
-   builder without causing the derivation to be built (for instance,
-   in the derivation that builds NARs in nix-push, when doing
-   source-only deployment).  This primop marks the string context so
-   that builtins.derivation adds the path to drv.inputSrcs rather than
-   drv.inputDrvs. */
-static void prim_unsafeDiscardOutputDependency(EvalState & state, const Pos & pos, Value * * args, Value & v)
-{
-    PathSet context;
-    string s = state.coerceToString(pos, *args[0], context);
-
-    PathSet context2;
-    for (auto & p : context)
-        context2.insert(p.at(0) == '=' ? "~" + string(p, 1) : p);
-
-    mkString(v, s, context2);
 }
 
 
@@ -2042,7 +2060,7 @@ void fetch(EvalState & state, const Pos & pos, Value * * args, Value & v,
 
     state.checkURI(url);
 
-    if (settings.pureEval && !expectedHash)
+    if (evalSettings.pureEval && !expectedHash)
         throw Error("in pure evaluation mode, '%s' requires a 'sha256' argument", who);
 
     Path res = getDownloader()->downloadCached(state.store, url, unpack, name, expectedHash);
@@ -2110,12 +2128,12 @@ void EvalState::createBaseEnv()
         addConstant(name, v);
     };
 
-    if (!settings.pureEval) {
+    if (!evalSettings.pureEval) {
         mkInt(v, time(0));
         addConstant("__currentTime", v);
     }
 
-    if (!settings.pureEval) {
+    if (!evalSettings.pureEval) {
         mkString(v, settings.thisSystem);
         addConstant("__currentSystem", v);
     }
@@ -2140,7 +2158,7 @@ void EvalState::createBaseEnv()
     mkApp(v, *vScopedImport, *v2);
     forceValue(v);
     addConstant("import", v);
-    if (settings.enableNativeCode) {
+    if (evalSettings.enableNativeCode) {
         addPrimOp("__importNative", 2, prim_importNative);
         addPrimOp("__exec", 1, prim_exec);
     }
@@ -2167,7 +2185,7 @@ void EvalState::createBaseEnv()
 
     // Paths
     addPrimOp("__toPath", 1, prim_toPath);
-    if (settings.pureEval)
+    if (evalSettings.pureEval)
         addPurityError("__storePath");
     else
         addPrimOp("__storePath", 1, prim_storePath);
@@ -2198,6 +2216,7 @@ void EvalState::createBaseEnv()
     addPrimOp("__intersectAttrs", 2, prim_intersectAttrs);
     addPrimOp("__catAttrs", 2, prim_catAttrs);
     addPrimOp("__functionArgs", 1, prim_functionArgs);
+    addPrimOp("__mapAttrs", 2, prim_mapAttrs);
 
     // Lists
     addPrimOp("__isList", 1, prim_isList);
@@ -2215,21 +2234,22 @@ void EvalState::createBaseEnv()
     addPrimOp("__genList", 2, prim_genList);
     addPrimOp("__sort", 2, prim_sort);
     addPrimOp("__partition", 2, prim_partition);
+    addPrimOp("__concatMap", 2, prim_concatMap);
 
     // Integer arithmetic
     addPrimOp("__add", 2, prim_add);
     addPrimOp("__sub", 2, prim_sub);
     addPrimOp("__mul", 2, prim_mul);
     addPrimOp("__div", 2, prim_div);
+    addPrimOp("__bitAnd", 2, prim_bitAnd);
+    addPrimOp("__bitOr", 2, prim_bitOr);
+    addPrimOp("__bitXor", 2, prim_bitXor);
     addPrimOp("__lessThan", 2, prim_lessThan);
 
     // String manipulation
     addPrimOp("toString", 1, prim_toString);
     addPrimOp("__substring", 3, prim_substring);
     addPrimOp("__stringLength", 1, prim_stringLength);
-    addPrimOp("__hasContext", 1, prim_hasContext);
-    addPrimOp("__unsafeDiscardStringContext", 1, prim_unsafeDiscardStringContext);
-    addPrimOp("__unsafeDiscardOutputDependency", 1, prim_unsafeDiscardOutputDependency);
     addPrimOp("__hashString", 2, prim_hashString);
     addPrimOp("__match", 2, prim_match);
     addPrimOp("__split", 2, prim_split);

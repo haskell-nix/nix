@@ -5,8 +5,10 @@
 #include "nixexpr.hh"
 #include "symbol-table.hh"
 #include "hash.hh"
+#include "config.hh"
 
 #include <map>
+#include <unordered_map>
 
 
 namespace nix {
@@ -34,8 +36,8 @@ struct Env
 {
     Env * up;
     unsigned short size; // used by ‘valueSize’
-    unsigned short prevWith:15; // nr of levels up to next `with' environment
-    unsigned short haveWithAttrs:1;
+    unsigned short prevWith:14; // nr of levels up to next `with' environment
+    enum { Plain = 0, HasWithExpr, HasWithAttrs } type:2;
     Value * values[0];
 };
 
@@ -88,6 +90,14 @@ public:
 private:
     SrcToStore srcToStore;
 
+    /* A cache from path names to parse trees. */
+#if HAVE_BOEHMGC
+    typedef std::map<Path, Expr *, std::less<Path>, traceable_allocator<std::pair<const Path, Expr *> > > FileParseCache;
+#else
+    typedef std::map<Path, Expr *> FileParseCache;
+#endif
+    FileParseCache fileParseCache;
+
     /* A cache from path names to values. */
 #if HAVE_BOEHMGC
     typedef std::map<Path, Value, std::less<Path>, traceable_allocator<std::pair<const Path, Value> > > FileEvalCache;
@@ -99,6 +109,9 @@ private:
     SearchPath searchPath;
 
     std::map<std::string, std::pair<bool, std::string>> searchPathResolved;
+
+    /* Cache used by checkSourcePath(). */
+    std::unordered_map<Path, Path> resolvedPaths;
 
 public:
 
@@ -214,7 +227,7 @@ private:
     Value * addConstant(const string & name, Value & v);
 
     Value * addPrimOp(const string & name,
-        unsigned int arity, PrimOpFun primOp);
+        size_t arity, PrimOpFun primOp);
 
 public:
 
@@ -248,18 +261,18 @@ public:
 
     /* Allocation primitives. */
     Value * allocValue();
-    Env & allocEnv(unsigned int size);
+    Env & allocEnv(size_t size);
 
     Value * allocAttr(Value & vAttrs, const Symbol & name);
 
-    Bindings * allocBindings(Bindings::size_t capacity);
+    Bindings * allocBindings(size_t capacity);
 
-    void mkList(Value & v, unsigned int length);
-    void mkAttrs(Value & v, unsigned int capacity);
+    void mkList(Value & v, size_t length);
+    void mkAttrs(Value & v, size_t capacity);
     void mkThunk_(Value & v, Expr * expr);
     void mkPos(Value & v, Pos * pos);
 
-    void concatLists(Value & v, unsigned int nrLists, Value * * lists, const Pos & pos);
+    void concatLists(Value & v, size_t nrLists, Value * * lists, const Pos & pos);
 
     /* Print statistics. */
     void printStats();
@@ -282,15 +295,15 @@ private:
 
     bool countCalls;
 
-    typedef std::map<Symbol, unsigned int> PrimOpCalls;
+    typedef std::map<Symbol, size_t> PrimOpCalls;
     PrimOpCalls primOpCalls;
 
-    typedef std::map<ExprLambda *, unsigned int> FunctionCalls;
+    typedef std::map<ExprLambda *, size_t> FunctionCalls;
     FunctionCalls functionCalls;
 
     void incrFunctionCall(ExprLambda * fun);
 
-    typedef std::map<Pos, unsigned int> AttrSelects;
+    typedef std::map<Pos, size_t> AttrSelects;
     AttrSelects attrSelects;
 
     friend struct ExprOpUpdate;
@@ -303,6 +316,9 @@ private:
 /* Return a string representing the type of the value `v'. */
 string showType(const Value & v);
 
+/* Decode a context string ‘!<name>!<path>’ into a pair <path,
+   name>. */
+std::pair<string, string> decodeContext(const string & s);
 
 /* If `path' refers to a directory, then append "/default.nix". */
 Path resolveExprPath(Path path);
@@ -315,5 +331,26 @@ struct InvalidPathError : EvalError
     ~InvalidPathError() throw () { };
 #endif
 };
+
+struct EvalSettings : Config
+{
+    Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation",
+        "Whether builtin functions that allow executing native code should be enabled."};
+
+    Setting<bool> restrictEval{this, false, "restrict-eval",
+        "Whether to restrict file system access to paths in $NIX_PATH, "
+        "and network access to the URI prefixes listed in 'allowed-uris'."};
+
+    Setting<bool> pureEval{this, false, "pure-eval",
+        "Whether to restrict file system and network access to files specified by cryptographic hash."};
+
+    Setting<bool> enableImportFromDerivation{this, true, "allow-import-from-derivation",
+        "Whether the evaluator allows importing the result of a derivation."};
+
+    Setting<Strings> allowedUris{this, {}, "allowed-uris",
+        "Prefixes of URIs that builtin functions such as fetchurl and fetchGit are allowed to fetch."};
+};
+
+extern EvalSettings evalSettings;
 
 }

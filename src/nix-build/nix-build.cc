@@ -16,6 +16,7 @@
 #include "get-drvs.hh"
 #include "common-eval-args.hh"
 #include "attr-path.hh"
+#include "legacy.hh"
 
 using namespace nix;
 using namespace std::string_literals;
@@ -66,11 +67,8 @@ std::vector<string> shellwords(const string & s)
     return res;
 }
 
-void mainWrapped(int argc, char * * argv)
+static void _main(int argc, char * * argv)
 {
-    initNix();
-    initGC();
-
     auto dryRun = false;
     auto runEnv = std::regex_search(argv[0], std::regex("nix-shell$"));
     auto pure = false;
@@ -85,7 +83,6 @@ void mainWrapped(int argc, char * * argv)
     BuildMode buildMode = bmNormal;
     bool readStdin = false;
 
-    auto shell = getEnv("SHELL", "/bin/sh");
     std::string envCommand; // interactive shell
     Strings envExclude;
 
@@ -98,6 +95,9 @@ void mainWrapped(int argc, char * * argv)
     AutoDelete tmpDir(createTempDir("", myName));
 
     std::string outLink = "./result";
+
+    // List of environment variables kept for --pure
+    std::set<string> keepVars{"HOME", "USER", "LOGNAME", "DISPLAY", "PATH", "TERM", "IN_NIX_SHELL", "TZ", "PAGER", "NIX_BUILD_SHELL", "SHLVL"};
 
     Strings args;
     for (int i = 1; i < argc; ++i)
@@ -218,6 +218,9 @@ void mainWrapped(int argc, char * * argv)
             }
         }
 
+        else if (*arg == "--keep")
+            keepVars.insert(getArg(*arg, arg, end));
+
         else if (*arg == "-")
             readStdin = true;
 
@@ -239,10 +242,10 @@ void mainWrapped(int argc, char * * argv)
 
     auto store = openStore();
 
-    EvalState state(myArgs.searchPath, store);
-    state.repair = repair;
+    auto state = std::make_unique<EvalState>(myArgs.searchPath, store);
+    state->repair = repair;
 
-    Bindings & autoArgs = *myArgs.getAutoArgs(state);
+    Bindings & autoArgs = *myArgs.getAutoArgs(*state);
 
     if (packages) {
         std::ostringstream joined;
@@ -268,7 +271,7 @@ void mainWrapped(int argc, char * * argv)
     std::vector<Expr *> exprs;
 
     if (readStdin)
-        exprs = {state.parseStdin()};
+        exprs = {state->parseStdin()};
     else
         for (auto i : left) {
             auto absolute = i;
@@ -276,13 +279,13 @@ void mainWrapped(int argc, char * * argv)
                 absolute = canonPath(absPath(i), true);
             } catch (Error e) {};
             if (fromArgs)
-                exprs.push_back(state.parseExprFromString(i, absPath(".")));
+                exprs.push_back(state->parseExprFromString(i, absPath(".")));
             else if (store->isStorePath(absolute) && std::regex_match(absolute, std::regex(".*\\.drv(!.*)?")))
-                drvs.push_back(DrvInfo(state, store, absolute));
+                drvs.push_back(DrvInfo(*state, store, absolute));
             else
                 /* If we're in a #! script, interpret filenames
                    relative to the script. */
-                exprs.push_back(state.parseExprFromFile(resolveExprPath(state.checkSourcePath(lookupFileArg(state,
+                exprs.push_back(state->parseExprFromFile(resolveExprPath(state->checkSourcePath(lookupFileArg(*state,
                     inShebang && !packages ? absPath(i, absPath(dirOf(script))) : i)))));
         }
 
@@ -291,14 +294,16 @@ void mainWrapped(int argc, char * * argv)
 
     for (auto e : exprs) {
         Value vRoot;
-        state.eval(e, vRoot);
+        state->eval(e, vRoot);
 
         for (auto & i : attrPaths) {
-            Value & v(*findAlongAttrPath(state, i, autoArgs, vRoot));
-            state.forceValue(v);
-            getDerivations(state, v, "", autoArgs, drvs, false);
+            Value & v(*findAlongAttrPath(*state, i, autoArgs, vRoot));
+            state->forceValue(v);
+            getDerivations(*state, v, "", autoArgs, drvs, false);
         }
     }
+
+    state->printStats();
 
     auto buildPaths = [&](const PathSet & paths) {
         /* Note: we do this even when !printMissing to efficiently
@@ -332,12 +337,12 @@ void mainWrapped(int argc, char * * argv)
         if (shell == "") {
 
             try {
-                auto expr = state.parseExprFromString("(import <nixpkgs> {}).bashInteractive", absPath("."));
+                auto expr = state->parseExprFromString("(import <nixpkgs> {}).bashInteractive", absPath("."));
 
                 Value v;
-                state.eval(expr, v);
+                state->eval(expr, v);
 
-                auto drv = getDerivation(state, v, false);
+                auto drv = getDerivation(*state, v, false);
                 if (!drv)
                     throw Error("the 'bashInteractive' attribute in <nixpkgs> did not evaluate to a derivation");
 
@@ -354,7 +359,7 @@ void mainWrapped(int argc, char * * argv)
         // Build or fetch all dependencies of the derivation.
         for (const auto & input : drv.inputDrvs)
             if (std::all_of(envExclude.cbegin(), envExclude.cend(), [&](const string & exclude) { return !std::regex_search(input.first, std::regex(exclude)); }))
-                pathsToBuild.insert(input.first);
+                pathsToBuild.insert(makeDrvPathWithOutputs(input.first, input.second));
         for (const auto & src : drv.inputSrcs)
             pathsToBuild.insert(src);
 
@@ -368,7 +373,6 @@ void mainWrapped(int argc, char * * argv)
         auto tmp = getEnv("TMPDIR", getEnv("XDG_RUNTIME_DIR", "/tmp"));
 
         if (pure) {
-            std::set<string> keepVars{"HOME", "USER", "LOGNAME", "DISPLAY", "PATH", "TERM", "IN_NIX_SHELL", "TZ", "PAGER", "NIX_BUILD_SHELL", "SHLVL"};
             decltype(env) newEnv;
             for (auto & i : env)
                 if (keepVars.count(i.first))
@@ -411,17 +415,20 @@ void mainWrapped(int argc, char * * argv)
                 "dontAddDisableDepTrack=1; "
                 "[ -e $stdenv/setup ] && source $stdenv/setup; "
                 "%3%"
+                "PATH=\"%4%:$PATH\"; "
+                "SHELL=%5%; "
                 "set +e; "
                 R"s([ -n "$PS1" ] && PS1='\n\[\033[1;32m\][nix-shell:\w]\$\[\033[0m\] '; )s"
                 "if [ \"$(type -t runHook)\" = function ]; then runHook shellHook; fi; "
                 "unset NIX_ENFORCE_PURITY; "
-                "unset NIX_INDENT_MAKE; "
                 "shopt -u nullglob; "
-                "unset TZ; %4%"
-                "%5%",
+                "unset TZ; %6%"
+                "%7%",
                 (Path) tmpDir,
                 (pure ? "" : "p=$PATH; "),
                 (pure ? "" : "PATH=$PATH:$p; unset p; "),
+                dirOf(shell),
+                shell,
                 (getenv("TZ") ? (string("export TZ='") + getenv("TZ") + "'; ") : ""),
                 envCommand));
 
@@ -495,9 +502,5 @@ void mainWrapped(int argc, char * * argv)
     }
 }
 
-int main(int argc, char * * argv)
-{
-    return handleExceptions(argv[0], [&]() {
-        return mainWrapped(argc, argv);
-    });
-}
+static RegisterLegacyCommand s1("nix-build", _main);
+static RegisterLegacyCommand s2("nix-shell", _main);

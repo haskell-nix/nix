@@ -6,8 +6,15 @@
 #include "eval-inline.hh"
 #include "common-eval-args.hh"
 #include "attr-path.hh"
+#include "legacy.hh"
+#include "finally.hh"
+#include "progress-bar.hh"
 
 #include <iostream>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 using namespace nix;
 
@@ -40,12 +47,9 @@ string resolveMirrorUri(EvalState & state, string uri)
 }
 
 
-int main(int argc, char * * argv)
+static int _main(int argc, char * * argv)
 {
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-        initGC();
-
+    {
         HashType ht = htSHA256;
         std::vector<string> args;
         bool printPath = getEnv("PRINT_PATH") != "";
@@ -94,10 +98,15 @@ int main(int argc, char * * argv)
         if (args.size() > 2)
             throw UsageError("too many arguments");
 
-        auto store = openStore();
-        EvalState state(myArgs.searchPath, store);
+        Finally f([]() { stopProgressBar(); });
 
-        Bindings & autoArgs = *myArgs.getAutoArgs(state);
+        if (isatty(STDERR_FILENO))
+          startProgressBar();
+
+        auto store = openStore();
+        auto state = std::make_unique<EvalState>(myArgs.searchPath, store);
+
+        Bindings & autoArgs = *myArgs.getAutoArgs(*state);
 
         /* If -A is given, get the URI from the specified Nix
            expression. */
@@ -107,33 +116,33 @@ int main(int argc, char * * argv)
                 throw UsageError("you must specify a URI");
             uri = args[0];
         } else {
-            Path path = resolveExprPath(lookupFileArg(state, args.empty() ? "." : args[0]));
+            Path path = resolveExprPath(lookupFileArg(*state, args.empty() ? "." : args[0]));
             Value vRoot;
-            state.evalFile(path, vRoot);
-            Value & v(*findAlongAttrPath(state, attrPath, autoArgs, vRoot));
-            state.forceAttrs(v);
+            state->evalFile(path, vRoot);
+            Value & v(*findAlongAttrPath(*state, attrPath, autoArgs, vRoot));
+            state->forceAttrs(v);
 
             /* Extract the URI. */
-            auto attr = v.attrs->find(state.symbols.create("urls"));
+            auto attr = v.attrs->find(state->symbols.create("urls"));
             if (attr == v.attrs->end())
                 throw Error("attribute set does not contain a 'urls' attribute");
-            state.forceList(*attr->value);
+            state->forceList(*attr->value);
             if (attr->value->listSize() < 1)
                 throw Error("'urls' list is empty");
-            uri = state.forceString(*attr->value->listElems()[0]);
+            uri = state->forceString(*attr->value->listElems()[0]);
 
             /* Extract the hash mode. */
-            attr = v.attrs->find(state.symbols.create("outputHashMode"));
+            attr = v.attrs->find(state->symbols.create("outputHashMode"));
             if (attr == v.attrs->end())
                 printInfo("warning: this does not look like a fetchurl call");
             else
-                unpack = state.forceString(*attr->value) == "recursive";
+                unpack = state->forceString(*attr->value) == "recursive";
 
             /* Extract the name. */
             if (name.empty()) {
-                attr = v.attrs->find(state.symbols.create("name"));
+                attr = v.attrs->find(state->symbols.create("name"));
                 if (attr != v.attrs->end())
-                    name = state.forceString(*attr->value);
+                    name = state->forceString(*attr->value);
             }
         }
 
@@ -158,16 +167,22 @@ int main(int argc, char * * argv)
 
         if (storePath.empty()) {
 
-            auto actualUri = resolveMirrorUri(state, uri);
-
-            /* Download the file. */
-            DownloadRequest req(actualUri);
-            req.decompress = false;
-            auto result = getDownloader()->download(req);
+            auto actualUri = resolveMirrorUri(*state, uri);
 
             AutoDelete tmpDir(createTempDir(), true);
             Path tmpFile = (Path) tmpDir + "/tmp";
-            writeFile(tmpFile, *result.data);
+
+            /* Download the file. */
+            {
+                AutoCloseFD fd = open(tmpFile.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (!fd) throw SysError("creating temporary file '%s'", tmpFile);
+
+                FdSink sink(fd.get());
+
+                DownloadRequest req(actualUri);
+                req.decompress = false;
+                getDownloader()->download(std::move(req), sink);
+            }
 
             /* Optionally unpack the file. */
             if (unpack) {
@@ -191,7 +206,7 @@ int main(int argc, char * * argv)
 
             /* FIXME: inefficient; addToStore() will also hash
                this. */
-            hash = unpack ? hashPath(ht, tmpFile).first : hashString(ht, *result.data);
+            hash = unpack ? hashPath(ht, tmpFile).first : hashFile(ht, tmpFile);
 
             if (expectedHash != Hash(ht) && expectedHash != hash)
                 throw Error(format("hash mismatch for '%1%'") % uri);
@@ -205,11 +220,17 @@ int main(int argc, char * * argv)
             assert(storePath == store->makeFixedOutputPath(unpack, hash, name));
         }
 
+        stopProgressBar();
+
         if (!printPath)
             printInfo(format("path is '%1%'") % storePath);
 
         std::cout << printHash16or32(hash) << std::endl;
         if (printPath)
             std::cout << storePath << std::endl;
-    });
+
+        return 0;
+    }
 }
+
+static RegisterLegacyCommand s1("nix-prefetch-url", _main);

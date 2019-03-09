@@ -13,26 +13,6 @@ namespace nix {
 
 typedef enum { smEnabled, smRelaxed, smDisabled } SandboxMode;
 
-extern bool useCaseHack; // FIXME
-
-struct CaseHackSetting : public BaseSetting<bool>
-{
-    CaseHackSetting(Config * options,
-        const std::string & name,
-        const std::string & description,
-        const std::set<std::string> & aliases = {})
-        : BaseSetting<bool>(useCaseHack, name, description, aliases)
-    {
-        options->addSetting(this);
-    }
-
-    void set(const std::string & str) override
-    {
-        BaseSetting<bool>::set(str);
-        nix::useCaseHack = value;
-    }
-};
-
 struct MaxBuildJobsSetting : public BaseSetting<unsigned int>
 {
     MaxBuildJobsSetting(Config * options,
@@ -52,13 +32,11 @@ class Settings : public Config {
 
     unsigned int getDefaultCores();
 
+    StringSet getDefaultSystemFeatures();
+
 public:
 
     Settings();
-
-    void loadConfFile();
-
-    void set(const string & name, const string & value);
 
     Path nixPrefix;
 
@@ -104,9 +82,9 @@ public:
     /* Whether to show build log output in real time. */
     bool verboseBuild = true;
 
-    /* If verboseBuild is false, the number of lines of the tail of
-       the log to show if a build fails. */
-    size_t logLines = 10;
+    Setting<size_t> logLines{this, 10, "log-lines",
+        "If verbose-build is false, the number of lines of the tail of "
+        "the log to show if a build fails."};
 
     MaxBuildJobsSetting maxBuildJobs{this, 1, "max-jobs",
         "Maximum number of parallel build jobs. \"auto\" means use number of cores.",
@@ -217,10 +195,13 @@ public:
     Setting<bool> showTrace{this, false, "show-trace",
         "Whether to show a stack trace on evaluation errors."};
 
-    Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation",
-        "Whether builtin functions that allow executing native code should be enabled."};
-
-    Setting<SandboxMode> sandboxMode{this, smDisabled, "sandbox",
+    Setting<SandboxMode> sandboxMode{this,
+        #if __linux__
+          smEnabled
+        #else
+          smDisabled
+        #endif
+        , "sandbox",
         "Whether to enable sandboxed builds. Can be \"true\", \"false\" or \"relaxed\".",
         {"build-use-chroot", "build-use-sandbox"}};
 
@@ -231,13 +212,6 @@ public:
     Setting<PathSet> extraSandboxPaths{this, {}, "extra-sandbox-paths",
         "Additional paths to make available inside the build sandbox.",
         {"build-extra-chroot-dirs", "build-extra-sandbox-paths"}};
-
-    Setting<bool> restrictEval{this, false, "restrict-eval",
-        "Whether to restrict file system access to paths in $NIX_PATH, "
-        "and network access to the URI prefixes listed in 'allowed-uris'."};
-
-    Setting<bool> pureEval{this, false, "pure-eval",
-        "Whether to restrict file system and network access to files specified by cryptographic hash."};
 
     Setting<size_t> buildRepeat{this, 0, "repeat",
         "The number of times to repeat a build in order to verify determinism.",
@@ -280,13 +254,6 @@ public:
     Setting<Strings> secretKeyFiles{this, {}, "secret-key-files",
         "Secret keys with which to sign local builds."};
 
-    Setting<size_t> binaryCachesParallelConnections{this, 25, "http-connections",
-        "Number of parallel HTTP connections.",
-        {"binary-caches-parallel-connections"}};
-
-    Setting<bool> enableHttp2{this, true, "http2",
-        "Whether to enable HTTP/2 support."};
-
     Setting<unsigned int> tarballTtl{this, 60 * 60, "tarball-ttl",
         "How soon to expire files fetched by builtins.fetchTarball and builtins.fetchurl."};
 
@@ -301,6 +268,10 @@ public:
         "Additional platforms that can be built on the local system. "
         "These may be supported natively (e.g. armv7 on some aarch64 CPUs "
         "or using hacks like qemu-user."};
+
+    Setting<StringSet> systemFeatures{this, getDefaultSystemFeatures(),
+        "system-features",
+        "Optional features that this system implements (like \"kvm\")."};
 
     Setting<Strings> substituters{this,
         nixStore == "/nix/store" ? Strings{"https://cache.nixos.org/"} : Strings(),
@@ -350,18 +321,6 @@ public:
     /* Path to the SSL CA file used */
     Path caFile;
 
-    Setting<bool> enableImportFromDerivation{this, true, "allow-import-from-derivation",
-        "Whether the evaluator allows importing the result of a derivation."};
-
-    CaseHackSetting useCaseHack{this, "use-case-hack",
-        "Whether to enable a Darwin-specific hack for dealing with file name collisions."};
-
-    Setting<unsigned long> connectTimeout{this, 0, "connect-timeout",
-        "Timeout for connecting to servers during downloads. 0 means use curl's builtin default."};
-
-    Setting<std::string> userAgentSuffix{this, "", "user-agent-suffix",
-        "String appended to the user agent in HTTP requests."};
-
 #if __linux__
     Setting<bool> filterSyscalls{this, true, "filter-syscalls",
             "Whether to prevent certain dangerous system calls, such as "
@@ -383,9 +342,6 @@ public:
     Setting<uint64_t> maxFree{this, std::numeric_limits<uint64_t>::max(), "max-free",
         "Stop deleting garbage when free disk space is above the specified amount."};
 
-    Setting<Strings> allowedUris{this, {}, "allowed-uris",
-        "Prefixes of URIs that builtin functions such as fetchurl and fetchGit are allowed to fetch."};
-
     Setting<Paths> pluginFiles{this, {}, "plugin-files",
         "Plugins to dynamically load at nix initialization time."};
 };
@@ -398,15 +354,8 @@ extern Settings settings;
    anything else */
 void initPlugins();
 
+void loadConfFile();
 
 extern const string nixVersion;
-
-struct RegisterSetting
-{
-    typedef std::vector<AbstractSetting *> SettingRegistrations;
-    static SettingRegistrations * settingRegistrations;
-    RegisterSetting(AbstractSetting * s);
-};
-
 
 }

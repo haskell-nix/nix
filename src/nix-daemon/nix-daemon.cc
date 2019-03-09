@@ -9,6 +9,7 @@
 #include "monitor-fd.hh"
 #include "derivations.hh"
 #include "finally.hh"
+#include "legacy.hh"
 
 #include <algorithm>
 
@@ -120,8 +121,6 @@ struct TunnelLogger : public Logger
       want to send out stderr to the client. */
     void startWork()
     {
-        std::vector<std::string> pendingMsgs;
-
         auto state(state_.lock());
         state->canSendStderr = true;
 
@@ -197,7 +196,8 @@ struct TunnelSource : BufferedSource
 {
     Source & from;
     TunnelSource(Source & from) : from(from) { }
-    size_t readUnbuffered(unsigned char * data, size_t len)
+protected:
+    size_t readUnbuffered(unsigned char * data, size_t len) override
     {
         to << STDERR_READ << len;
         to.flush();
@@ -234,7 +234,7 @@ struct RetrieveRegularNARSink : ParseSink
 };
 
 
-static void performOp(TunnelLogger * logger, ref<LocalStore> store,
+static void performOp(TunnelLogger * logger, ref<Store> store,
     bool trusted, unsigned int clientVersion,
     Source & from, Sink & to, unsigned int op)
 {
@@ -363,7 +363,11 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
 
         logger->startWork();
         if (!savedRegular.regular) throw Error("regular file expected");
-        Path path = store->addToStoreFromDump(recursive ? *savedNAR.data : savedRegular.s, baseName, recursive, hashAlgo);
+
+        auto store2 = store.dynamic_pointer_cast<LocalStore>();
+        if (!store2) throw Error("operation is only supported by LocalStore");
+
+        Path path = store2->addToStoreFromDump(recursive ? *savedNAR.data : savedRegular.s, baseName, recursive, hashAlgo);
         logger->stopWork();
 
         to << path;
@@ -554,7 +558,8 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
                     ;
                 else if (trusted
                     || name == settings.buildTimeout.name
-                    || name == settings.connectTimeout.name)
+                    || name == "connect-timeout"
+                    || (name == "builders" && value == ""))
                     settings.set(name, value);
                 else if (setSubstituters(settings.substituters))
                     ;
@@ -691,12 +696,23 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
         if (!trusted)
             info.ultimate = false;
 
-        TeeSink tee(from);
-        parseDump(tee, tee.source);
+        std::string saved;
+        std::unique_ptr<Source> source;
+        if (GET_PROTOCOL_MINOR(clientVersion) >= 21)
+            source = std::make_unique<TunnelSource>(from);
+        else {
+            TeeSink tee(from);
+            parseDump(tee, tee.source);
+            saved = std::move(*tee.source.data);
+            source = std::make_unique<StringSource>(saved);
+        }
 
         logger->startWork();
-        store.cast<Store>()->addToStore(info, tee.source.data, (RepairFlag) repair,
+
+        // FIXME: race if addToStore doesn't read source?
+        store->addToStore(info, *source, (RepairFlag) repair,
             dontCheckSigs ? NoCheckSigs : CheckSigs, nullptr);
+
         logger->stopWork();
         break;
     }
@@ -767,7 +783,7 @@ static void processConnection(bool trusted)
         Store::Params params; // FIXME: get params from somewhere
         // Disable caching since the client already does that.
         params["path-info-cache-size"] = "0";
-        auto store = make_ref<LocalStore>(params);
+        auto store = openStore(settings.storeUri, params);
 
         tunnelLogger->stopWork();
         to.flush();
@@ -1043,11 +1059,9 @@ static void daemonLoop(char * * argv)
 }
 
 
-int main(int argc, char * * argv)
+static int _main(int argc, char * * argv)
 {
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-
+    {
         auto stdio = false;
 
         parseCmdLine(argc, argv, [&](Strings::iterator & arg, const Strings::iterator & end) {
@@ -1107,7 +1121,7 @@ int main(int argc, char * * argv)
                         if (res == -1)
                             throw SysError("splicing data from stdin to daemon socket");
                         else if (res == 0)
-                            return;
+                            return 0;
                     }
                 }
             } else {
@@ -1116,5 +1130,9 @@ int main(int argc, char * * argv)
         } else {
             daemonLoop(argv);
         }
-    });
+
+        return 0;
+    }
 }
+
+static RegisterLegacyCommand s1("nix-daemon", _main);

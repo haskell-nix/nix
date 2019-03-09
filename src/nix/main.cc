@@ -24,7 +24,6 @@ struct NixArgs : virtual MultiCommand, virtual MixCommonArgs
     {
         mkFlag()
             .longName("help")
-            .shortName('h')
             .description("show usage information")
             .handler([&]() { showHelpAndExit(); });
 
@@ -34,9 +33,10 @@ struct NixArgs : virtual MultiCommand, virtual MixCommonArgs
             .handler([&]() {
                 std::cout << "The following configuration options are available:\n\n";
                 Table2 tbl;
-                for (const auto & s : settings._getSettings())
-                    if (!s.second.isAlias)
-                        tbl.emplace_back(s.first, s.second.setting->description);
+                std::map<std::string, Config::SettingInfo> settings;
+                globalConfig.getSettings(settings);
+                for (const auto & s : settings)
+                    tbl.emplace_back(s.first, s.second.description);
                 printTable(std::cout, tbl);
                 throw Exit();
             });
@@ -67,9 +67,6 @@ struct NixArgs : virtual MultiCommand, virtual MixCommonArgs
 
 void mainWrapped(int argc, char * * argv)
 {
-    verbosity = lvlError;
-    settings.verboseBuild = false;
-
     /* The chroot helper needs to be run before any threads have been
        started. */
     if (argc > 0 && argv[0] == chrootHelperName) {
@@ -87,6 +84,9 @@ void mainWrapped(int argc, char * * argv)
         auto legacy = (*RegisterLegacyCommand::commands)[programName];
         if (legacy) return legacy(argc, argv);
     }
+
+    verbosity = lvlError;
+    settings.verboseBuild = false;
 
     NixArgs args;
 

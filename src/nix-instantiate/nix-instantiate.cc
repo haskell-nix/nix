@@ -9,6 +9,7 @@
 #include "util.hh"
 #include "store-api.hh"
 #include "common-eval-args.hh"
+#include "legacy.hh"
 
 #include <map>
 #include <iostream>
@@ -83,12 +84,9 @@ void processExpr(EvalState & state, const Strings & attrPaths,
 }
 
 
-int main(int argc, char * * argv)
+static int _main(int argc, char * * argv)
 {
-    return handleExceptions(argv[0], [&]() {
-        initNix();
-        initGC();
-
+    {
         Strings files;
         bool readStdin = false;
         bool fromArgs = false;
@@ -158,37 +156,41 @@ int main(int argc, char * * argv)
 
         auto store = openStore();
 
-        EvalState state(myArgs.searchPath, store);
-        state.repair = repair;
+        auto state = std::make_unique<EvalState>(myArgs.searchPath, store);
+        state->repair = repair;
 
-        Bindings & autoArgs = *myArgs.getAutoArgs(state);
+        Bindings & autoArgs = *myArgs.getAutoArgs(*state);
 
         if (attrPaths.empty()) attrPaths = {""};
 
         if (findFile) {
             for (auto & i : files) {
-                Path p = state.findFile(i);
+                Path p = state->findFile(i);
                 if (p == "") throw Error(format("unable to find '%1%'") % i);
                 std::cout << p << std::endl;
             }
-            return;
+            return 0;
         }
 
         if (readStdin) {
-            Expr * e = state.parseStdin();
-            processExpr(state, attrPaths, parseOnly, strict, autoArgs,
+            Expr * e = state->parseStdin();
+            processExpr(*state, attrPaths, parseOnly, strict, autoArgs,
                 evalOnly, outputKind, xmlOutputSourceLocation, e);
         } else if (files.empty() && !fromArgs)
             files.push_back("./default.nix");
 
         for (auto & i : files) {
             Expr * e = fromArgs
-                ? state.parseExprFromString(i, absPath("."))
-                : state.parseExprFromFile(resolveExprPath(state.checkSourcePath(lookupFileArg(state, i))));
-            processExpr(state, attrPaths, parseOnly, strict, autoArgs,
+                ? state->parseExprFromString(i, absPath("."))
+                : state->parseExprFromFile(resolveExprPath(state->checkSourcePath(lookupFileArg(*state, i))));
+            processExpr(*state, attrPaths, parseOnly, strict, autoArgs,
                 evalOnly, outputKind, xmlOutputSourceLocation, e);
         }
 
-        state.printStats();
-    });
+        state->printStats();
+
+        return 0;
+    }
 }
+
+static RegisterLegacyCommand s1("nix-instantiate", _main);

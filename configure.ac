@@ -64,6 +64,7 @@ AC_PROG_CXX
 AC_PROG_CPP
 AX_CXX_COMPILE_STDCXX_14
 
+AC_CHECK_TOOL([AR], [ar])
 
 # Use 64-bit file system calls so that we can support files > 2 GiB.
 AC_SYS_LARGEFILE
@@ -127,8 +128,6 @@ NEED_PROG(bzip2, bzip2)
 NEED_PROG(gzip, gzip)
 NEED_PROG(xz, xz)
 AC_PATH_PROG(dot, dot)
-AC_PATH_PROG(pv, pv, pv)
-AC_PATH_PROGS(brotli, brotli bro, bro)
 AC_PATH_PROG(lsof, lsof, lsof)
 
 
@@ -152,9 +151,9 @@ PKG_CHECK_MODULES([OPENSSL], [libcrypto], [CXXFLAGS="$OPENSSL_CFLAGS $CXXFLAGS"]
 
 # Look for libbz2, a required dependency.
 AC_CHECK_LIB([bz2], [BZ2_bzWriteOpen], [true],
-  [AC_MSG_ERROR([Nix requires libbz2, which is part of bzip2.  See http://www.bzip.org/.])])
+  [AC_MSG_ERROR([Nix requires libbz2, which is part of bzip2.  See https://web.archive.org/web/20180624184756/http://www.bzip.org/.])])
 AC_CHECK_HEADERS([bzlib.h], [true],
-  [AC_MSG_ERROR([Nix requires libbz2, which is part of bzip2.  See http://www.bzip.org/.])])
+  [AC_MSG_ERROR([Nix requires libbz2, which is part of bzip2.  See https://web.archive.org/web/20180624184756/http://www.bzip.org/.])])
 
 
 # Look for SQLite, a required dependency.
@@ -164,6 +163,8 @@ PKG_CHECK_MODULES([SQLITE3], [sqlite3 >= 3.6.19], [CXXFLAGS="$SQLITE3_CFLAGS $CX
 # Look for libcurl, a required dependency.
 PKG_CHECK_MODULES([LIBCURL], [libcurl], [CXXFLAGS="$LIBCURL_CFLAGS $CXXFLAGS"])
 
+# Look for editline, a required dependency.
+PKG_CHECK_MODULES([EDITLINE], [libeditline], [CXXFLAGS="$EDITLINE_CFLAGS $CXXFLAGS"])
 
 # Look for libsodium, an optional dependency.
 PKG_CHECK_MODULES([SODIUM], [libsodium],
@@ -179,12 +180,9 @@ AC_CHECK_LIB([lzma], [lzma_stream_encoder_mt],
   [AC_DEFINE([HAVE_LZMA_MT], [1], [xz multithreaded compression support])])
 
 
-# Look for libbrotli{enc,dec}, optional dependencies
-PKG_CHECK_MODULES([LIBBROTLI], [libbrotlienc libbrotlidec],
-  [AC_DEFINE([HAVE_BROTLI], [1], [Whether to use libbrotli.])
-   CXXFLAGS="$LIBBROTLI_CFLAGS $CXXFLAGS"]
-   have_brotli=1], [have_brotli=])
-AC_SUBST(HAVE_BROTLI, [$have_brotli])
+# Look for libbrotli{enc,dec}.
+PKG_CHECK_MODULES([LIBBROTLI], [libbrotlienc libbrotlidec], [CXXFLAGS="$LIBBROTLI_CFLAGS $CXXFLAGS"])
+
 
 # Look for libseccomp, required for Linux sandboxing.
 if test "$sys_name" = linux; then
@@ -232,12 +230,6 @@ if test "$gc" = yes; then
 fi
 
 
-AC_ARG_ENABLE(init-state, AC_HELP_STRING([--disable-init-state],
-  [do not initialise DB etc. in `make install']),
-  init_state=$enableval, init_state=yes)
-#AM_CONDITIONAL(INIT_STATE, test "$init_state" = "yes")
-
-
 # documentation generation switch
 AC_ARG_ENABLE(doc-gen, AC_HELP_STRING([--disable-doc-gen],
   [disable documentation generation]),
@@ -260,11 +252,6 @@ if test "$(uname)" = "Darwin"; then
 fi
 
 
-# Figure out the extension of dynamic libraries.
-eval dynlib_suffix=$shrext_cmds
-AC_SUBST(dynlib_suffix)
-
-
 # Do we have GNU tar?
 AC_MSG_CHECKING([if you have a recent GNU tar])
 if $tar --version 2> /dev/null | grep -q GNU && tar cvf /dev/null --warning=no-timestamp ./config.log > /dev/null; then
@@ -280,6 +267,15 @@ AC_ARG_WITH(sandbox-shell, AC_HELP_STRING([--with-sandbox-shell=PATH],
   [path of a statically-linked shell to use as /bin/sh in sandboxes]),
   sandbox_shell=$withval)
 AC_SUBST(sandbox_shell)
+
+AC_ARG_ENABLE(shared, AC_HELP_STRING([--enable-shared],
+  [Build shared libraries for Nix [default=yes]]),
+  shared=$enableval, shared=yes)
+if test "$shared" = yes; then
+  AC_SUBST(BUILD_SHARED_LIBS, 1, [Whether to build shared libraries.])
+else
+  AC_SUBST(BUILD_SHARED_LIBS, 0, [Whether to build shared libraries.])
+fi
 
 
 # Expand all variables in config.status.

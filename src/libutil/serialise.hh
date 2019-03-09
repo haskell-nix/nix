@@ -77,10 +77,12 @@ struct BufferedSource : Source
 
     size_t read(unsigned char * data, size_t len) override;
 
-    /* Underlying read call, to be overridden. */
-    virtual size_t readUnbuffered(unsigned char * data, size_t len) = 0;
 
     bool hasData();
+
+protected:
+    /* Underlying read call, to be overridden. */
+    virtual size_t readUnbuffered(unsigned char * data, size_t len) = 0;
 };
 
 
@@ -134,8 +136,9 @@ struct FdSource : BufferedSource
         return *this;
     }
 
-    size_t readUnbuffered(unsigned char * data, size_t len) override;
     bool good() override;
+protected:
+    size_t readUnbuffered(unsigned char * data, size_t len) override;
 private:
     bool _good = true;
 };
@@ -211,7 +214,11 @@ struct LambdaSource : Source
 
 /* Convert a function that feeds data into a Sink into a Source. The
    Source executes the function as a coroutine. */
-std::unique_ptr<Source> sinkToSource(std::function<void(Sink &)> fun);
+std::unique_ptr<Source> sinkToSource(
+    std::function<void(Sink &)> fun,
+    std::function<void()> eof = []() {
+        throw EndOfFile("coroutine has finished");
+    });
 
 
 void writePadding(size_t len, Sink & sink);
@@ -227,7 +234,7 @@ inline Sink & operator << (Sink & sink, uint64_t n)
     buf[4] = (n >> 32) & 0xff;
     buf[5] = (n >> 40) & 0xff;
     buf[6] = (n >> 48) & 0xff;
-    buf[7] = (n >> 56) & 0xff;
+    buf[7] = (unsigned char) (n >> 56) & 0xff;
     sink(buf, sizeof(buf));
     return sink;
 }
@@ -259,7 +266,7 @@ T readNum(Source & source)
     if (n > std::numeric_limits<T>::max())
         throw SerialisationError("serialised integer %d is too large for type '%s'", n, typeid(T).name());
 
-    return n;
+    return (T) n;
 }
 
 
@@ -277,7 +284,7 @@ inline uint64_t readLongLong(Source & source)
 
 void readPadding(size_t len, Source & source);
 size_t readString(unsigned char * buf, size_t max, Source & source);
-string readString(Source & source);
+string readString(Source & source, size_t max = std::numeric_limits<size_t>::max());
 template<class T> T readStrings(Source & source);
 
 Source & operator >> (Source & in, string & s);

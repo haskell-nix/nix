@@ -450,7 +450,7 @@ static void canonicalisePathMetaData_(const Path & path, uid_t fromUid, InodesSe
     ssize_t eaSize = llistxattr(path.c_str(), nullptr, 0);
 
     if (eaSize < 0) {
-        if (errno != ENOTSUP)
+        if (errno != ENOTSUP && errno != ENODATA)
             throw SysError("querying extended attributes of '%s'", path);
     } else if (eaSize > 0) {
         std::vector<char> eaBuf(eaSize);
@@ -581,7 +581,8 @@ void LocalStore::checkDerivationOutputs(const Path & drvPath, const Derivation &
 uint64_t LocalStore::addValidPath(State & state,
     const ValidPathInfo & info, bool checkOutputs)
 {
-    assert(info.ca == "" || info.isContentAddressed(*this));
+    if (info.ca != "" && !info.isContentAddressed(*this))
+        throw Error("cannot add path '%s' to the Nix store because it claims to be content-addressed but isn't", info.path);
 
     state.stmtRegisterValidPath.use()
         (info.path)
@@ -628,17 +629,15 @@ uint64_t LocalStore::addValidPath(State & state,
 
 
 void LocalStore::queryPathInfoUncached(const Path & path,
-    std::function<void(std::shared_ptr<ValidPathInfo>)> success,
-    std::function<void(std::exception_ptr exc)> failure)
+    Callback<std::shared_ptr<ValidPathInfo>> callback)
 {
-    sync2async<std::shared_ptr<ValidPathInfo>>(success, failure, [&]() {
-
+    try {
         auto info = std::make_shared<ValidPathInfo>();
         info->path = path;
 
         assertStorePath(path);
 
-        return retrySQLite<std::shared_ptr<ValidPathInfo>>([&]() {
+        callback(retrySQLite<std::shared_ptr<ValidPathInfo>>([&]() {
             auto state(_state.lock());
 
             /* Get the path info. */
@@ -678,8 +677,9 @@ void LocalStore::queryPathInfoUncached(const Path & path,
                 info->references.insert(useQueryReferences.getStr(0));
 
             return info;
-        });
-    });
+        }));
+
+    } catch (...) { callback.rethrow(); }
 }
 
 
@@ -880,6 +880,12 @@ void LocalStore::querySubstitutablePathInfos(const PathSet & paths,
                     narInfo ? narInfo->fileSize : 0,
                     info->narSize};
             } catch (InvalidPath) {
+            } catch (SubstituterDisabled) {
+            } catch (Error & e) {
+                if (settings.tryFallback)
+                    printError(e.what());
+                else
+                    throw;
             }
         }
     }
@@ -975,7 +981,8 @@ const PublicKeys & LocalStore::getPublicKeys()
 void LocalStore::addToStore(const ValidPathInfo & info, Source & source,
     RepairFlag repair, CheckSigsFlag checkSigs, std::shared_ptr<FSAccessor> accessor)
 {
-    assert(info.narHash);
+    if (!info.narHash)
+        throw Error("cannot add path '%s' because it lacks a hash", info.path);
 
     if (requireSigs && checkSigs && !info.checkSignatures(*this, getPublicKeys()))
         throw Error("cannot add path '%s' because it lacks a valid signature", info.path);
@@ -1013,11 +1020,11 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source,
             auto hashResult = hashSink.finish();
 
             if (hashResult.first != info.narHash)
-                throw Error("hash mismatch importing path '%s'; expected hash '%s', got '%s'",
+                throw Error("hash mismatch importing path '%s';\n  wanted: %s\n  got:    %s",
                     info.path, info.narHash.to_string(), hashResult.first.to_string());
 
             if (hashResult.second != info.narSize)
-                throw Error("size mismatch importing path '%s'; expected %s, got %s",
+                throw Error("size mismatch importing path '%s';\n  wanted: %s\n  got:   %s",
                     info.path, info.narSize, hashResult.second);
 
             autoGC();
@@ -1328,6 +1335,12 @@ void LocalStore::verifyPath(const Path & path, const PathSet & store,
     }
 
     validPaths.insert(path);
+}
+
+
+unsigned int LocalStore::getProtocol()
+{
+    return PROTOCOL_VERSION;
 }
 
 

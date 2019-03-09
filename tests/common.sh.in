@@ -31,7 +31,6 @@ export xmllint="@xmllint@"
 export SHELL="@bash@"
 export PAGER=cat
 export HAVE_SODIUM="@HAVE_SODIUM@"
-export HAVE_BROTLI="@HAVE_BROTLI@"
 
 export version=@PACKAGE_VERSION@
 export system=@system@
@@ -86,19 +85,14 @@ killDaemon() {
     trap "" EXIT
 }
 
+if [[ $(uname) == Linux ]] && [[ -L /proc/self/ns/user ]] && unshare --user true; then
+    _canUseSandbox=1
+fi
+
 canUseSandbox() {
-    if [[ $(uname) != Linux ]]; then return 1; fi
-
-    if [ ! -L /proc/self/ns/user ]; then
-        echo "Kernel doesn't support user namespaces, skipping this test..."
+    if [[ ! $_canUseSandbox ]]; then
+        echo "Sandboxing not supported, skipping this test..."
         return 1
-    fi
-
-    if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
-        if [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" != 1 ]; then
-            echo "Unprivileged user namespaces disabled by sysctl, skipping this test..."
-            return 1
-        fi
     fi
 
     return 0

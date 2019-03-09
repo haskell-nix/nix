@@ -127,8 +127,7 @@ public:
     PathSet queryAllValidPaths() override;
 
     void queryPathInfoUncached(const Path & path,
-        std::function<void(std::shared_ptr<ValidPathInfo>)> success,
-        std::function<void(std::exception_ptr exc)> failure) override;
+        Callback<std::shared_ptr<ValidPathInfo>> callback) override;
 
     void queryReferrers(const Path & path, PathSet & referrers) override;
 
@@ -209,6 +208,8 @@ public:
     void registerValidPath(const ValidPathInfo & info);
 
     void registerValidPaths(const ValidPathInfos & infos);
+
+    unsigned int getProtocol() override;
 
     void vacuumDB();
 

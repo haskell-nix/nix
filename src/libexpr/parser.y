@@ -31,12 +31,10 @@ namespace nix {
         Path basePath;
         Symbol path;
         string error;
-        bool atEnd;
         Symbol sLetBody;
         ParseData(EvalState & state)
             : state(state)
             , symbols(state.symbols)
-            , atEnd(false)
             , sLetBody(symbols.create("<let-body>"))
             { };
     };
@@ -136,8 +134,8 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<Ex
        whitespace-only final lines are not taken into account.  (So
        the " " in "\n ''" is ignored, but the " " in "\n foo''" is.) */
     bool atStartOfLine = true; /* = seen only whitespace in the current line */
-    unsigned int minIndent = 1000000;
-    unsigned int curIndent = 0;
+    size_t minIndent = 1000000;
+    size_t curIndent = 0;
     for (auto & i : es) {
         ExprIndStr * e = dynamic_cast<ExprIndStr *>(i);
         if (!e) {
@@ -148,7 +146,7 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<Ex
             }
             continue;
         }
-        for (unsigned int j = 0; j < e->s.size(); ++j) {
+        for (size_t j = 0; j < e->s.size(); ++j) {
             if (atStartOfLine) {
                 if (e->s[j] == ' ')
                     curIndent++;
@@ -170,8 +168,8 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<Ex
     /* Strip spaces from each line. */
     vector<Expr *> * es2 = new vector<Expr *>;
     atStartOfLine = true;
-    unsigned int curDropped = 0;
-    unsigned int n = es.size();
+    size_t curDropped = 0;
+    size_t n = es.size();
     for (vector<Expr *>::iterator i = es.begin(); i != es.end(); ++i, --n) {
         ExprIndStr * e = dynamic_cast<ExprIndStr *>(*i);
         if (!e) {
@@ -182,7 +180,7 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<Ex
         }
 
         string s2;
-        for (unsigned int j = 0; j < e->s.size(); ++j) {
+        for (size_t j = 0; j < e->s.size(); ++j) {
             if (atStartOfLine) {
                 if (e->s[j] == ' ') {
                     if (curDropped++ >= minIndent)
@@ -275,11 +273,11 @@ void yyerror(YYLTYPE * loc, yyscan_t scanner, ParseData * data, const char * err
 %token IND_STRING_OPEN IND_STRING_CLOSE
 %token ELLIPSIS
 
-%nonassoc IMPL
+%right IMPL
 %left OR
 %left AND
 %nonassoc EQ NEQ
-%left '<' '>' LEQ GEQ
+%nonassoc '<' '>' LEQ GEQ
 %right UPDATE
 %left NOT
 %left '+' '-'
@@ -541,12 +539,7 @@ Expr * EvalState::parse(const char * text,
     int res = yyparse(scanner, &data);
     yylex_destroy(scanner);
 
-    if (res) {
-      if (data.atEnd)
-        throw IncompleteParseError(data.error);
-      else
-        throw ParseError(data.error);
-    }
+    if (res) throw ParseError(data.error);
 
     data.result->bindVars(staticEnv);
 

@@ -2,6 +2,7 @@
 
 #include "types.hh"
 #include "hash.hh"
+#include "globals.hh"
 
 #include <string>
 #include <future>
@@ -20,9 +21,15 @@ struct DownloadRequest
     bool decompress = true;
     std::shared_ptr<std::string> data;
     std::string mimeType;
+    std::function<void(char *, size_t)> dataCallback;
 
     DownloadRequest(const std::string & uri)
         : uri(uri), parentAct(getCurActivity()) { }
+
+    std::string verb()
+    {
+        return data ? "upload" : "download";
+    }
 };
 
 struct DownloadResult
@@ -31,6 +38,7 @@ struct DownloadResult
     std::string etag;
     std::string effectiveUrl;
     std::shared_ptr<std::string> data;
+    uint64_t bodySize = 0;
 };
 
 class Store;
@@ -41,20 +49,23 @@ struct Downloader
        the download. The future may throw a DownloadError
        exception. */
     virtual void enqueueDownload(const DownloadRequest & request,
-        std::function<void(const DownloadResult &)> success,
-        std::function<void(std::exception_ptr exc)> failure) = 0;
+        Callback<DownloadResult> callback) = 0;
 
     std::future<DownloadResult> enqueueDownload(const DownloadRequest & request);
 
     /* Synchronously download a file. */
     DownloadResult download(const DownloadRequest & request);
 
+    /* Download a file, writing its data to a sink. The sink will be
+       invoked on the thread of the caller. */
+    void download(DownloadRequest && request, Sink & sink);
+
     /* Check if the specified file is already in ~/.cache/nix/tarballs
        and is more recent than ‘tarball-ttl’ seconds. Otherwise,
        use the recorded ETag to verify if the server has a more
        recent version, and if so, download it to the Nix store. */
     Path downloadCached(ref<Store> store, const string & uri, bool unpack, string name = "",
-        const Hash & expectedHash = Hash(), string * effectiveUri = nullptr);
+        const Hash & expectedHash = Hash(), string * effectiveUri = nullptr, int ttl = settings.tarballTtl);
 
     enum Error { NotFound, Forbidden, Misc, Transient, Interrupted };
 };
@@ -76,8 +87,5 @@ public:
 };
 
 bool isUri(const string & s);
-
-/* Decode data according to the Content-Encoding header. */
-ref<std::string> decodeContent(const std::string & encoding, ref<std::string> data);
 
 }

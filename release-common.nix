@@ -30,7 +30,7 @@ rec {
   });
 
   configureFlags =
-    [ "--disable-init-state"
+    [
       "--enable-gc"
     ] ++ lib.optionals stdenv.isLinux [
       "--with-sandbox-shell=${sh}/bin/busybox"
@@ -49,7 +49,7 @@ rec {
 
   buildDeps =
     [ curl
-      bzip2 xz brotli
+      bzip2 xz brotli editline
       openssl pkgconfig sqlite boehmgc
       boost
 
@@ -57,13 +57,20 @@ rec {
       git
       mercurial
     ]
-    ++ lib.optional stdenv.isLinux libseccomp
+    ++ lib.optionals stdenv.isLinux [libseccomp utillinuxMinimal]
     ++ lib.optional (stdenv.isLinux || stdenv.isDarwin) libsodium
     ++ lib.optional (stdenv.isLinux || stdenv.isDarwin)
-      (aws-sdk-cpp.override {
-        apis = ["s3"];
+      ((aws-sdk-cpp.override {
+        apis = ["s3" "transfer"];
         customMemoryManagement = false;
-      });
+      }).overrideDerivation (args: {
+        /*
+        patches = args.patches or [] ++ [ (fetchpatch {
+          url = https://github.com/edolstra/aws-sdk-cpp/commit/3e07e1f1aae41b4c8b340735ff9e8c735f0c063f.patch;
+          sha256 = "1pij0v449p166f9l29x7ppzk8j7g9k9mp15ilh5qxp29c7fnvxy2";
+        }) ];
+        */
+      }));
 
   perlDeps =
     [ perl

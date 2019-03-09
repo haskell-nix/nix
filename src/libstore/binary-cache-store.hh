@@ -38,11 +38,16 @@ public:
         const std::string & data,
         const std::string & mimeType) = 0;
 
-    /* Return the contents of the specified file, or null if it
-       doesn't exist. */
+    /* Note: subclasses must implement at least one of the two
+       following getFile() methods. */
+
+    /* Dump the contents of the specified file to a sink. */
+    virtual void getFile(const std::string & path, Sink & sink);
+
+    /* Fetch the specified file and call the specified callback with
+       the result. A subclass may implement this asynchronously. */
     virtual void getFile(const std::string & path,
-        std::function<void(std::shared_ptr<std::string>)> success,
-        std::function<void(std::exception_ptr exc)> failure) = 0;
+        Callback<std::shared_ptr<std::string>> callback);
 
     std::shared_ptr<std::string> getFile(const std::string & path);
 
@@ -67,25 +72,11 @@ public:
 
     bool isValidPathUncached(const Path & path) override;
 
-    PathSet queryAllValidPaths() override
-    { unsupported(); }
-
     void queryPathInfoUncached(const Path & path,
-        std::function<void(std::shared_ptr<ValidPathInfo>)> success,
-        std::function<void(std::exception_ptr exc)> failure) override;
-
-    void queryReferrers(const Path & path,
-        PathSet & referrers) override
-    { unsupported(); }
-
-    PathSet queryDerivationOutputs(const Path & path) override
-    { unsupported(); }
-
-    StringSet queryDerivationOutputNames(const Path & path) override
-    { unsupported(); }
+        Callback<std::shared_ptr<ValidPathInfo>> callback) override;
 
     Path queryPathFromHashPart(const string & hashPart) override
-    { unsupported(); }
+    { unsupported("queryPathFromHashPart"); }
 
     bool wantMassQuery() override { return wantMassQuery_; }
 
@@ -104,22 +95,10 @@ public:
 
     BuildResult buildDerivation(const Path & drvPath, const BasicDerivation & drv,
         BuildMode buildMode) override
-    { unsupported(); }
+    { unsupported("buildDerivation"); }
 
     void ensurePath(const Path & path) override
-    { unsupported(); }
-
-    void addTempRoot(const Path & path) override
-    { unsupported(); }
-
-    void addIndirectRoot(const Path & path) override
-    { unsupported(); }
-
-    Roots findRoots() override
-    { unsupported(); }
-
-    void collectGarbage(const GCOptions & options, GCResults & results) override
-    { unsupported(); }
+    { unsupported("ensurePath"); }
 
     ref<FSAccessor> getFSAccessor() override;
 
@@ -130,5 +109,7 @@ public:
     int getPriority() override { return priority; }
 
 };
+
+MakeError(NoSuchBinaryCacheFile, Error);
 
 }

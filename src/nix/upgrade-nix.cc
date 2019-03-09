@@ -1,14 +1,18 @@
 #include "command.hh"
+#include "common-args.hh"
 #include "store-api.hh"
 #include "download.hh"
 #include "eval.hh"
 #include "attr-path.hh"
+#include "names.hh"
+#include "progress-bar.hh"
 
 using namespace nix;
 
-struct CmdUpgradeNix : StoreCommand
+struct CmdUpgradeNix : MixDryRun, StoreCommand
 {
     Path profileDir;
+    std::string storePathsUrl = "https://github.com/NixOS/nixpkgs/raw/master/nixos/modules/installer/tools/nix-fallback-paths.nix";
 
     CmdUpgradeNix()
     {
@@ -18,6 +22,12 @@ struct CmdUpgradeNix : StoreCommand
             .labels({"profile-dir"})
             .description("the Nix profile to upgrade")
             .dest(&profileDir);
+
+        mkFlag()
+            .longName("nix-store-paths-url")
+            .labels({"url"})
+            .description("URL of the file that contains the store paths of the latest Nix release")
+            .dest(&storePathsUrl);
     }
 
     std::string name() override
@@ -46,7 +56,7 @@ struct CmdUpgradeNix : StoreCommand
 
     void run(ref<Store> store) override
     {
-        settings.pureEval = true;
+        evalSettings.pureEval = true;
 
         if (profileDir == "")
             profileDir = getProfileDir(store);
@@ -57,6 +67,14 @@ struct CmdUpgradeNix : StoreCommand
         {
             Activity act(*logger, lvlInfo, actUnknown, "querying latest Nix version");
             storePath = getLatestNix(store);
+        }
+
+        auto version = DrvName(storePathToName(storePath)).version;
+
+        if (dryRun) {
+            stopProgressBar();
+            printError("would upgrade to version %s", version);
+            return;
         }
 
         {
@@ -72,11 +90,15 @@ struct CmdUpgradeNix : StoreCommand
                 throw Error("could not verify that '%s' works", program);
         }
 
+        stopProgressBar();
+
         {
             Activity act(*logger, lvlInfo, actUnknown, fmt("installing '%s' into profile '%s'...", storePath, profileDir));
             runProgram(settings.nixBinDir + "/nix-env", false,
                 {"--profile", profileDir, "-i", storePath, "--no-sandbox"});
         }
+
+        printError(ANSI_GREEN "upgrade to version %s done" ANSI_NORMAL, version);
     }
 
     /* Return the profile in which Nix is installed. */
@@ -98,11 +120,18 @@ struct CmdUpgradeNix : StoreCommand
         if (hasPrefix(where, "/run/current-system"))
             throw Error("Nix on NixOS must be upgraded via 'nixos-rebuild'");
 
-        Path profileDir;
-        Path userEnv;
+        Path profileDir = dirOf(where);
+
+        // Resolve profile to /nix/var/nix/profiles/<name> link.
+        while (canonPath(profileDir).find("/profiles/") == std::string::npos && isLink(profileDir))
+            profileDir = readLink(profileDir);
+
+        printInfo("found profile '%s'", profileDir);
+
+        Path userEnv = canonPath(profileDir, true);
 
         if (baseNameOf(where) != "bin" ||
-            !hasSuffix(userEnv = canonPath(profileDir = dirOf(where), true), "user-environment"))
+            !hasSuffix(userEnv, "user-environment"))
             throw Error("directory '%s' does not appear to be part of a Nix profile", where);
 
         if (!store->isValidPath(userEnv))
@@ -115,16 +144,16 @@ struct CmdUpgradeNix : StoreCommand
     Path getLatestNix(ref<Store> store)
     {
         // FIXME: use nixos.org?
-        auto req = DownloadRequest("https://github.com/NixOS/nixpkgs/raw/master/nixos/modules/installer/tools/nix-fallback-paths.nix");
+        auto req = DownloadRequest(storePathsUrl);
         auto res = getDownloader()->download(req);
 
-        EvalState state(Strings(), store);
-        auto v = state.allocValue();
-        state.eval(state.parseExprFromString(*res.data, "/no-such-path"), *v);
-        Bindings & bindings(*state.allocBindings(0));
-        auto v2 = findAlongAttrPath(state, settings.thisSystem, bindings, *v);
+        auto state = std::make_unique<EvalState>(Strings(), store);
+        auto v = state->allocValue();
+        state->eval(state->parseExprFromString(*res.data, "/no-such-path"), *v);
+        Bindings & bindings(*state->allocBindings(0));
+        auto v2 = findAlongAttrPath(*state, settings.thisSystem, bindings, *v);
 
-        return state.forceString(*v2);
+        return state->forceString(*v2);
     }
 };
 

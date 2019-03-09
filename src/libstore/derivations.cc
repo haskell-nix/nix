@@ -36,12 +36,6 @@ Path BasicDerivation::findOutput(const string & id) const
 }
 
 
-bool BasicDerivation::willBuildLocally() const
-{
-    return get(env, "preferLocalBuild") == "1" && canBuildLocally();
-}
-
-
 bool BasicDerivation::substitutesAllowed() const
 {
     return get(env, "allowSubstitutes", "1") == "1";
@@ -51,14 +45,6 @@ bool BasicDerivation::substitutesAllowed() const
 bool BasicDerivation::isBuiltin() const
 {
     return string(builder, 0, 8) == "builtin:";
-}
-
-
-bool BasicDerivation::canBuildLocally() const
-{
-    return platform == settings.thisSystem
-        || settings.extraPlatforms.get().count(platform) > 0
-        || isBuiltin();
 }
 
 
@@ -342,7 +328,7 @@ Hash hashDerivationModulo(Store & store, Derivation drv)
         Hash h = drvHashes[i.first];
         if (!h) {
             assert(store.isValidPath(i.first));
-            Derivation drv2 = readDerivation(i.first);
+            Derivation drv2 = readDerivation(store.toRealPath(i.first));
             h = hashDerivationModulo(store, drv2);
             drvHashes[i.first] = h;
         }
